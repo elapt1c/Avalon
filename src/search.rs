@@ -23,7 +23,7 @@ use crate::score::{self, Atmos, EventSpec, Track};
 const GRID_M: f64 = 200.0;
 /// Cells in the level-0 grid over the whole region. Refinement levels add only
 /// a few hundred cells each, so this is the only real cost knob.
-const COARSE_CELLS: usize = 24_000;
+const COARSE_CELLS: usize = 60_000;
 /// Sub-division factor per refinement level (children per parent side).
 ///
 /// Must be EVEN: the children are centred on the parent with `LEVEL_SPLIT/2`
@@ -413,6 +413,7 @@ pub fn run_search(
     // sub-divided are flagged `superseded` so their cheap-and-noisy score cannot
     // outrank the children that replaced them.
     let mut cells: Vec<Cell> = Vec::new();
+    let level0_step_m = step_m;
     let mut frontier = grid_cells(&bounds, step_m);
     let mut level = 0usize;
     let mut scored_total = 0usize;
@@ -675,9 +676,47 @@ pub fn run_search(
         None => (None, Vec::new()),
     };
 
+    // ---- honesty about the regime ----------------------------------------
+    // The score kernel is a few hundred metres to a few kilometres wide, so a
+    // level-0 grid coarser than that can step straight over the true location.
+    // Say so; do not present a screening pass as a fix.
+    let warning = if level0_step_m > 4_000.0 {
+        Some(format!(
+            "Region is too large for a reliable fix: the search grid is {:.1} km at its \
+             coarsest level, but the score kernel is only ~1 km wide, so the true \
+             location can be missed entirely between cells. Results are a screening \
+             pass only — narrow the region to a few hundred kilometres (or narrow the \
+             time window and re-run) before trusting a point.",
+            level0_step_m / 1000.0
+        ))
+    } else if modes.len() > 1 {
+        let (a, b) = (&modes[0], &modes[1]);
+        let margin = (a.score - b.score) / a.score.max(1e-6);
+        if margin < 0.20 {
+            Some(format!(
+                "Near-tie: the top two solutions are {:.0} km apart ({} vs {}) and differ \
+                 by only {:.0}%. Two unrelated flight pairs can fit both measured curves \
+                 this well; use other evidence to choose.",
+                haversine_km((a.lat, a.lon), (b.lat, b.lon)),
+                a.pair,
+                b.pair,
+                margin * 100.0
+            ))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    if let Some(w) = &warning {
+        on_log(format!("WARNING: {w}"));
+        crate::log::warn("search", w);
+    }
+
     Ok(SearchResult {
         cells: out,
         best,
+        warning,
         modes,
         n_flights: n_flights_total,
         n_candidates: cells.len(),

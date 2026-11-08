@@ -963,9 +963,13 @@ impl App {
             // Near-ties are the normal continental failure mode: two unrelated
             // flight pairs can fit both measured curves to within a few
             // hundredths of a Hz. Say so instead of presenting one point as fact.
+            if let Some(w) = &res.warning {
+                ui.add_space(4.0);
+                ui.label(RichText::new(w).color(theme::WARN).small());
+            }
             if let (Some(a), Some(b)) = (res.modes.first(), res.modes.get(1)) {
                 let margin = (a.score - b.score) / a.score.max(1e-6);
-                if margin < 0.20 {
+                if margin < 0.20 && res.warning.is_none() {
                     ui.label(
                         RichText::new(format!(
                             "⚠ near-tie: {:.0}% margin between the top {} modes — pick using other evidence",

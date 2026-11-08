@@ -22,6 +22,47 @@ So the information is present (a 1 km solution exists), but the scorer prefers a
 wrong location because **clock shift trades against position**, and the coarse
 grid (5 shifts, 5 f0 values) cannot resolve the trade.
 
+## 1b. After correcting the date, the aircraft and the archive parser — 2026-11-08
+
+Three defects, each fatal on its own, now fixed or identified:
+
+1. **Archive parser dropped 74 % of flights.** `parse_trace` used `?` on every row, so a
+   single malformed row (readsb leaves `null` in optional slots) discarded the entire
+   flight. The reference box went from **617 → 2379 flights** once bad rows were skipped
+   instead of killing the track — and the two aircraft we were looking for had been among
+   the discarded ones.
+2. **Wrong day**: 2026-10-30/31 instead of 2026-09-08.
+3. **Wrong pair**: Citation X + G450 (jets) instead of the PC-12 + King Air 350 that
+   actually flew the passes.
+
+Corrected reference case, verified against the archive itself:
+
+| | |
+|---|---|
+| `a1dfeb` N22NY, Pilatus PC-12 | closest approach **2.77 km** at 20:53:00Z, 5,524 m |
+| `ace391` N93CQ, King Air 350 | closest approach **3.49 km** at 21:08:41Z, 1,059 m |
+
+Measured with `examples/benchmark` (production scorer, unchanged):
+
+| Metric | Wrong pair / wrong day | Correct pair / correct day |
+|---|---|---|
+| Residual at the true receiver, production grid | 17.3 Hz | **2.09 Hz** |
+| Joint bounded fit | 118 km | **1.7 km** (rmse 3.65 Hz) |
+| Target ≤ 10 km | FAIL | **PASS** |
+| Scoring time | — | 0.6 s |
+
+Two conclusions worth carrying:
+
+- **The coarse shift/f0 grid was never the main problem.** With the right aircraft, the
+  production 5×5 grid already scores 2.09 Hz at truth. The 118 km was wrong-input, not
+  coarse-grid. A dense shift sweep adds nothing here.
+- **Input hygiene dominates every algorithm choice.** A one-line parser bug and a wrong
+  date were worth 100× more than any optimiser.
+
+The real remaining problem is **candidate selection**: ranking `a1dfeb,ace391` first out of
+2379 flights (dopplertrack: #1 of 328 pairs). That is where ridge-mode scoring, the Δt
+filter and the silence filter earn their place.
+
 ## 2. How the reference implementations solve the same problem
 
 `mjshiggins/dopplertrack` (MIT, reimplementation of the same technique) reports on
@@ -102,7 +143,8 @@ that fits the amplitude cannot win.
 
 | # | Change | Why | Expected |
 |---|---|---|---|
-| 1 | Correct archive date; re-benchmark | Wrong-day flights ⇒ any answer is meaningless | resolves the dominant error |
+| 0 | ~~Fix archive parser~~ (**done**: 617 → 2379 flights) | `?` on every row silently dropped 74 % of tracks | recovered the true aircraft |
+| 1 | ~~Correct archive date~~ (**done**: 2026-09-08) | wrong-day flights ⇒ any answer meaningless | 118 km → 1.7 km |
 | 2 | Prop-only candidate filter (ICAO type/engine class) | Tones are blade-pass; jets cannot match | removes most false minima |
 | 3 | Shared clock bounded to ±1 s, selected by CPA-slope alignment on the measured ridge | Kills the shift/position degeneracy that produced the 31 km / 3.4 Hz minimum | 31 km → inside 10 km |
 | 4 | Hard Δt consistency filter during candidate generation | Only absolute-time anchor when the start epoch is unknown | cuts (pair, point) space ~10² |

@@ -534,11 +534,18 @@ pub fn parse_trace(bytes: &[u8], region: &[Bounds], t0: f64, t1: f64) -> Option<
     let mut in_region = false;
     let mut points: Vec<FlightPoint> = Vec::new();
     for p in trace {
-        let arr = p.as_array()?;
-        let dt = arr.get(0)?.as_f64()?;
-        let lat = arr.get(1)?.as_f64()?;
-        let lon = arr.get(2)?.as_f64()?;
-        let alt_ft = arr.get(3)?.as_f64()?;
+        // A single malformed row (readsb leaves nulls in optional slots) must not
+        // discard the whole flight — that silently drops ~40 % of the day's tracks,
+        // including, in the reference case, both aircraft we were looking for.
+        let Some(arr) = p.as_array() else { continue };
+        let (Some(dt), Some(lat), Some(lon), Some(alt_ft)) = (
+            arr.first().and_then(|x| x.as_f64()),
+            arr.get(1).and_then(|x| x.as_f64()),
+            arr.get(2).and_then(|x| x.as_f64()),
+            arr.get(3).and_then(|x| x.as_f64()),
+        ) else {
+            continue;
+        };
         // Prefer geometric altitude (p[10]) when present.
         let geom = arr.get(10).and_then(|x| x.as_f64()).filter(|x| x.is_finite());
         let alt_m = geom.unwrap_or(alt_ft) * 0.3048;

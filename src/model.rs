@@ -140,6 +140,10 @@ pub struct SearchResult {
     pub cells: Vec<HeatmapCell>,
     /// Top candidate locations, best first.
     pub best: Vec<HeatmapCell>,
+    /// A human-readable caveat about this search, e.g. that the region was too
+    /// large for the score kernel to be sampled. `None` when the run is sound.
+    #[serde(default)]
+    pub warning: Option<String>,
     /// Distinct near-tied solutions, best first. With two events and a free
     /// rest frequency this is normally longer than one; treat entries within a
     /// small score margin of the leader as equally supported.
