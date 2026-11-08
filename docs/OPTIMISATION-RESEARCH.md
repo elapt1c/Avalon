@@ -61,22 +61,42 @@ ranking statistics, not calibrated probabilities.
 
 ## 3. Three findings specific to Avalon (highest priority)
 
-1. **The search window is probably the wrong date.** Our archive window is
-   2026-10-30 11:00 → 2026-10-31 23:00, but this recording is colsto's, published as
-   a 2026-09-08 capture from Oyster Bay, NY (40.8765, −73.5250). Our measured Δt of
-   921.9 s matches the published 918 s to within the audio-fit error. If the true
-   flights are not in the archive, no amount of scoring work can recover the
-   position — and the optimizer will happily lock onto whatever geometry fits
-   best on the wrong day. **First action: fetch 2026-09-08 and re-run the benchmark.**
-2. **The "known pair" is two jets.** `a67ba8` = N517CF, Cessna **Citation X**;
-   `a659a2` = N508WF, Gulfstream **G450**. Measured rest frequencies are 119.6 Hz and
-   136.6 Hz — turbofans do not produce a clean 100 s blade-pass sweep there, while
-   turboprops do (PC-12 ≈ 113 Hz, King Air 350 ≈ 133 Hz at typical RPM). The known
-   pair is very likely wrong, which explains the 8–12 Hz residual floor, the
-   f0 pinned at its ±3 % bound, and the 30–50 s shifts the fit invents.
+1. **The search window was the wrong date.** CONFIRMED with colsto: the recording is
+   **2026-09-08**, Oyster Bay NY (40.876466, −73.524951), and the aircraft are
+   **bushplanes/turboprops**, not jets. Our archive window was 2026-10-30/31 — seven
+   weeks late — so the true flights were never in the candidate set and the scorer
+   locked onto the best-fitting geometry from the wrong day. Our measured Δt of
+   921.9 s matches the published 918 s within fit error, which was the tell.
+   The 2026-09-08 archive (3.87 GB) is now cached; `AVALON_WIN` selects the window.
+2. **The old "known pair" was two jets.** `a67ba8` = N517CF, Cessna **Citation X**;
+   `a659a2` = N508WF, Gulfstream **G450**. Turbofans do not produce a clean 100 s
+   blade-pass sweep at 119.6 / 136.6 Hz; turboprops do (PC-12 ≈ 113 Hz, King Air 350
+   ≈ 133 Hz at typical RPM). That explains the 8–12 Hz residual floor, f0 pinned at
+   its ±3 % bound and the 30–50 s shifts the fit invented. The correct pair for
+   2026-09-08 is a Pilatus PC-12 (`a1dfeb`, N22NY) and a King Air 350 (`ace391`,
+   N93CQ) — both turboprops, matching colsto's "bushplanes".
 3. **Jet/type information is not used anywhere in candidate generation.** Even on
    the correct day, including jets inflates the candidate set by ~an order of
    magnitude and adds false minima.
+
+## 3b. Concrete parameters worth copying (dopplertrack 2026-11-03)
+
+| Knob | Value | Why |
+|---|---|---|
+| Prop-only filter | ICAO Doc 8643 engine class (Piston/Turboprop), drop Jets | tones are blade-pass |
+| Δt tolerance (`tol_s`) | 6 s between heard CPAs | event pairing, unknown epoch |
+| Silence filter | 6 km / 40 s margin | no intervening closer pass |
+| Max slant range | 12 km | beyond this the tone is usually inaudible |
+| Candidate grid | 1 km coarse → 200 m → 50 m refine | 379k points in 19 min on a laptop |
+| Clock | shared, ≤ 0.5 s | one recording clock for all events |
+| Speed of sound | 340–343 m/s, no wind term | 3 % of c, same order as residuals |
+| Index | 1 Hz ENU segments, time buckets + per-bucket KD-tree | O(points × flights) → O(points × nearby) |
+| Scoring | **ridge mode**: per reliable frame `exp(-0.5 (df/σf)²)`, σ = 1.5 % | brightness cannot separate candidates on a faint tone; ridge position can |
+| Ridge reliability | ≥ 3 dB bright AND ≥ 3 dB more than the best alternative path | rejects birds/second tones |
+
+Ridge-mode scoring is the one change that most directly attacks our 3.4 Hz false
+minimum: it scores *where the curve is*, not how bright it is, so a wrong location
+that fits the amplitude cannot win.
 
 ## 4. Optimisation backlog, ranked by expected accuracy gain per unit work
 
