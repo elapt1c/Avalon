@@ -8,6 +8,17 @@ Dark, QGIS-inspired GUI. Rust. Built around a faithful reimplementation of the
 [DOPPLERGEIST](https://github.com/1337isnot1337/DOPPLERGEIST) aircraft-Doppler
 method.
 
+## Interface
+
+Tactical instrument-panel surface: monospaced throughout, hairline borders, a single
+signal-cyan accent with amber/red reserved for state, and a persistent instrument strip
+(mission line, state pill, UTC clock) with a live readout column (fix, window, region,
+events, archive).
+
+| Standby | Locating |
+|---|---|
+| ![standby](docs/design/standby.png) | ![locating](docs/design/locating.png) |
+
 ## What this version does
 
 1. **Ingest** a source video or audio file (OS native file dialog, or drag-and-drop).

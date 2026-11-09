@@ -393,8 +393,7 @@ pub fn run_search(
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(COARSE_CELLS)
         .max(64);
-    let mut step_m = (lat_extent_m * lon_extent_m / coarse_cells as f64)
-        .sqrt()
+    let mut step_m = level0_step_m(lat_extent_m, lon_extent_m, coarse_cells)
         .max(GRID_M)
         .max(min_step);
 
@@ -785,6 +784,11 @@ impl Quality {
             Quality::Fine => SHIFT_STEPS_FINE,
         }
     }
+}
+
+/// Spacing of the level-0 grid for a region of the given extent.
+fn level0_step_m(lat_extent_m: f64, lon_extent_m: f64, cells: usize) -> f64 {
+    (lat_extent_m.max(1.0) * lon_extent_m.max(1.0) / cells.max(64) as f64).sqrt()
 }
 
 /// Uniform grid covering `b`, spaced `step_m` metres.
@@ -1508,6 +1512,17 @@ mod tests {
         let f = Flight { icao: "LONG".into(), points };
         let tr = build_track(&f, SCORE_DT, (40.0, -90.0), 3_000_000.0);
         assert!(tr.is_some(), "6 h passage inside the region was discarded");
+    }
+
+    /// A continental region cannot be gridded finely enough for the score
+    /// kernel, and the search says so instead of returning a confident wrong
+    /// state. This pins the arithmetic behind that warning.
+    #[test]
+    fn continental_region_is_flagged_as_screening_only() {
+        let conus = level0_step_m(24.0 * 111_320.0, 59.0 * 111_320.0 * 0.8, COARSE_CELLS);
+        assert!(conus > 4_000.0, "CONUS level-0 spacing was only {conus:.0} m");
+        let city = level0_step_m(160_000.0, 190_000.0, COARSE_CELLS);
+        assert!(city < 1_000.0, "a 190x160 km box gridded at {city:.0} m");
     }
 
     /// Parked / taxiing transponders must still be rejected - by motion, since

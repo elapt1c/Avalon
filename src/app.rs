@@ -30,7 +30,7 @@ fn default_year() -> i64 {
 }
 
 /// Ground truth of the test recording (lat, lon) — used to score the result.
-const TRUTH: (f64, f64) = (40.87, -73.52);
+const TRUTH: (f64, f64) = (40.876466, -73.524951);
 
 /// Great-circle distance in metres.
 fn haversine_m(a: (f64, f64), b: (f64, f64)) -> f64 {
@@ -41,6 +41,34 @@ fn haversine_m(a: (f64, f64), b: (f64, f64)) -> f64 {
     let dlon = lo2 - lo1;
     let h = (dlat / 2.0).sin().powi(2) + la1.cos() * la2.cos() * (dlon / 2.0).sin().powi(2);
     2.0 * r * h.sqrt().asin()
+}
+
+/// Compact `MM-DD HH:MM` for readouts.
+fn short_utc(unix: i64) -> String {
+    let sod = unix.rem_euclid(86_400);
+    let days = unix.div_euclid(86_400);
+    // civil_from_days (Howard Hinnant)
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let _ = y;
+    format!("{:02}-{:02} {:02}:{:02}", m, d, sod / 3600, (sod % 3600) / 60)
+}
+
+/// `HH:MM:SS` UTC clock for the instrument strip.
+fn chrono_like_utc() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let sod = secs % 86_400;
+    format!("{:02}:{:02}:{:02}", sod / 3600, (sod % 3600) / 60, sod % 60)
 }
 
 enum AnalysisState {
@@ -162,11 +190,11 @@ impl App {
             map: MapState::new(39.0, -98.0, 4.0),
             map_open: false,
             map_purpose: MapPurpose::Region,
-            // Daytime in New York. The test footage's two passes resolve to
-            // 2026-10-30 15:34Z (both implied starts agree inside 7 s), so the
-            // default spans the 30th and the 31st rather than the 31st alone.
-            time_start_unix: Some(dateutil::civil_to_unix(default_year(), 10, 30, 11, 0, 0)),
-            time_end_unix: Some(dateutil::civil_to_unix(default_year(), 10, 31, 23, 0, 0)),
+            // The reference recording was made 2026-09-08 near Oyster Bay NY; its
+            // two flyovers fall at 20:53Z and 21:09Z, so the default window spans
+            // that evening rather than the whole day.
+            time_start_unix: Some(dateutil::civil_to_unix(default_year(), 9, 8, 18, 0, 0)),
+            time_end_unix: Some(dateutil::civil_to_unix(default_year(), 9, 8, 23, 30, 0)),
             cal_open: false,
             cal_target: CalTarget::Start,
             cal_year: 2026,
@@ -624,25 +652,100 @@ impl App {
             self.selected_path = Some(path);
             self.start_analysis();
         }
+        self.top_bar(ui);
         self.source_panel(ui);
         self.intel_panel(ui);
         self.status_bar(ui);
         self.central_panel(ui);
     }
 
+    /// Instrument strip: wordmark, mission line, state, UTC clock.
+    fn top_bar(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::top("top_bar")
+            .frame(egui::Frame::new()
+                .fill(theme::VOID)
+                .inner_margin(egui::Margin::symmetric(14, 7)))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    // Wordmark
+                    ui.label(
+                        egui::RichText::new("AVALON")
+                            .monospace()
+                            .size(17.0)
+                            .strong()
+                            .color(theme::ACCENT_BRIGHT),
+                    );
+                    ui.add_space(10.0);
+                    ui.label(egui::RichText::new("│").monospace().color(theme::BORDER_HI));
+                    ui.add_space(10.0);
+                    ui.vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new("ACOUSTIC SIGNAL GEOLOCATION")
+                                .monospace()
+                                .size(9.5)
+                                .color(theme::MUTED),
+                        );
+                        ui.label(
+                            egui::RichText::new("DOPPLER / ADS-B MATCHING SUITE")
+                                .monospace()
+                                .size(9.5)
+                                .color(theme::DIM),
+                        );
+                    });
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let now = chrono_like_utc();
+                        ui.label(
+                            egui::RichText::new(now)
+                                .monospace()
+                                .size(12.0)
+                                .color(theme::TEXT),
+                        );
+                        ui.label(theme::label("utc"));
+                        ui.add_space(14.0);
+                        let (txt, col) = if self.show_processing {
+                            ("LOCATING", theme::WARN)
+                        } else {
+                            match &self.analysis {
+                                AnalysisState::Running { .. } => ("ANALYSING", theme::WARN),
+                                AnalysisState::Error(_) => ("FAULT", theme::ERROR),
+                                _ if self.result.is_some() => ("READY", theme::ACCENT),
+                                _ => ("STANDBY", theme::DIM),
+                            }
+                        };
+                        theme::pill(ui, txt, col);
+                        ui.add_space(14.0);
+                        ui.label(
+                            egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                                .monospace()
+                                .size(10.0)
+                                .color(theme::DIM),
+                        );
+                    });
+                });
+            });
+        // Accent rule under the strip
+        let r = ui.max_rect();
+        let _ = r;
+    }
+
     fn source_panel(&mut self, ui: &mut egui::Ui) {
         egui::Panel::left("source_panel")
+            .frame(theme::panel_frame(theme::PANEL))
             .resizable(true)
-            .default_size(300.0)
-            .min_size(200.0)
+            .default_size(320.0)
+            .min_size(240.0)
             .max_size(420.0)
             .show(ui, |ui| {
-                ui.heading(RichText::new("Avalon").color(theme::ACCENT_BRIGHT));
-                ui.label(RichText::new("acoustic Doppler geolocation").color(theme::MUTED).small());
-                ui.add_space(4.0);
-
-                ui.label(RichText::new("Source").strong());
-                if ui.button("Browse file…").clicked() {
+                ui.add_space(2.0);
+                ui.label(
+                    egui::RichText::new("SOURCE INGEST")
+                        .monospace()
+                        .size(10.0)
+                        .color(theme::DIM),
+                );
+                theme::section(ui, "source");
+                if ui.button("BROWSE FILE…").clicked() {
                     if let Some(p) = rfd::FileDialog::new()
                         .add_filter("Media", &["wav", "mp3", "flac", "ogg", "m4a", "aac", "mp4", "mkv", "mov", "avi", "webm", "aiff", "caf"])
                         .pick_file()
@@ -665,14 +768,14 @@ impl App {
                 let running = matches!(self.analysis, AnalysisState::Running { .. });
                 let btn = ui.add_enabled(
                     !running && self.selected_path.is_some(),
-                    egui::Button::new("▶ Analyze (detect ridges)"),
+                    egui::Button::new("▸ ANALYSE · DETECT RIDGES"),
                 );
                 if btn.clicked() {
                     self.start_analysis();
                 }
 
                 ui.add_space(6.0);
-                ui.collapsing("Analysis settings", |ui| {
+                ui.collapsing("ANALYSIS SETTINGS", |ui| {
                     egui::Grid::new("settings_grid").num_columns(2).show(ui, |ui| {
                         ui.label("Min freq (Hz)");
                         ui.add(egui::DragValue::new(&mut self.settings.min_freq_hz).range(1.0..=2000.0).speed(1.0));
@@ -714,16 +817,45 @@ impl App {
                     );
                 });
 
-                ui.collapsing("Log", |ui| {
-                    for line in &self.log {
-                        ui.label(RichText::new(line).color(theme::MUTED).small());
-                    }
+                theme::section(ui, "log");
+                for line in &self.log {
+                    ui.label(
+                        egui::RichText::new(line)
+                            .monospace()
+                            .size(9.5)
+                            .color(theme::DIM),
+                    );
+                }
+
+                // -- instrument readout, pinned to the bottom of the column --
+                let fix = match self.search_result.as_ref().and_then(|r| r.best.first()) {
+                    Some(c) => format!("{:.4} / {:.4}", c.lat, c.lon),
+                    None => "— —".to_string(),
+                };
+                let win = match (self.time_start_unix, self.time_end_unix) {
+                    (Some(a), Some(b)) => format!("{} → {}", short_utc(a), short_utc(b)),
+                    _ => "UNSET".to_string(),
+                };
+                let events = match &self.result {
+                    Some(r) => r.events.len().to_string(),
+                    None => "0".to_string(),
+                };
+                let regions = format!("{} BOX", self.region.len());
+                let archive = self.provider.to_uppercase();
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                    theme::kv(ui, "archive", &archive, theme::DIM);
+                    theme::kv(ui, "events", &events, theme::TEXT);
+                    theme::kv(ui, "region", &regions, theme::TEXT);
+                    theme::kv(ui, "window", &win, theme::TEXT);
+                    theme::kv(ui, "fix", &fix, theme::ACCENT);
+                    theme::rule(ui);
                 });
             });
     }
 
     fn intel_panel(&mut self, ui: &mut egui::Ui) {
         egui::Panel::right("intel_panel")
+            .frame(theme::panel_frame(theme::PANEL))
             .resizable(true)
             .default_size(340.0)
             .min_size(260.0)
@@ -734,20 +866,20 @@ impl App {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                    ui.heading(RichText::new("Intelligence").color(theme::ACCENT_BRIGHT));
+                    theme::section(ui, "intelligence");
 
                     // Region.
                     ui.add_space(4.0);
-                    ui.label(RichText::new("Geographic region").strong());
+                    theme::section(ui, "geographic region");
                     ui.horizontal(|ui| {
-                        if ui.button("Set on map").clicked() {
+                        if ui.button("SET ON MAP").clicked() {
                             self.map.set_rectangles(self.region.clone());
                             self.map.clear_heatmap();
                             self.map.mode = Mode::Select;
                             self.map_purpose = MapPurpose::Region;
                             self.map_open = true;
                         }
-                        if ui.button("Clear").clicked() {
+                        if ui.button("CLEAR").clicked() {
                             self.region.clear();
                         }
                     });
@@ -773,7 +905,7 @@ impl App {
                     ui.separator();
 
                     // Time window (mandatory).
-                    ui.label(RichText::new("Time window (UTC, mandatory)").strong());
+                    theme::section(ui, "time window / utc");
                     ui.horizontal(|ui| {
                         ui.label("Start");
                         let s = self.time_start_unix.map(fmt_civil).unwrap_or_else(|| "—".into());
@@ -797,7 +929,7 @@ impl App {
                     ui.separator();
 
                     // Provider.
-                    ui.label(RichText::new("Flight data").strong());
+                    theme::section(ui, "flight data");
                     egui::ComboBox::from_id_salt("provider")
                         .selected_text(self.provider.clone())
                         .show_ui(ui, |ui| {
@@ -824,7 +956,7 @@ impl App {
                     ui.add_space(8.0);
 
                     // Events.
-                    ui.label(RichText::new("Detected events").strong());
+                    theme::section(ui, "detected events");
                     self.events_ui(ui);
 
                     ui.separator();
@@ -918,7 +1050,7 @@ impl App {
 
     fn process_ui(&mut self, ui: &mut egui::Ui) {
         let running = matches!(self.search, SearchState::Running { .. });
-        let btn = ui.add_enabled(!running, egui::Button::new("⟳ Process (locate)"));
+        let btn = ui.add_enabled(!running, egui::Button::new("⟳ PROCESS · LOCATE"));
         if btn.clicked() {
             self.start_search();
         }
@@ -1151,7 +1283,7 @@ impl App {
         ];
         egui::Grid::new("proc_tiles")
             .num_columns(4)
-            .spacing([18.0, 6.0])
+            .spacing([10.0, 10.0])
             .show(ui, |ui| {
                 for (i, (label, value)) in tiles.iter().enumerate() {
                     tile(ui, label, value);
@@ -1214,7 +1346,9 @@ impl App {
     }
 
     fn central_panel(&mut self, ui: &mut egui::Ui) {
-        egui::CentralPanel::default().show(ui, |ui| {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(theme::BG))
+            .show(ui, |ui| {
             // The locate stage is where the real work happens; keep it in the
             // main area for the whole run *and* afterwards, so a failure shows
             // its reason here instead of silently reverting to the spectrogram.
@@ -1238,16 +1372,31 @@ impl App {
                     });
                 }
                 _ if self.result.is_none() => {
-                    ui.add_space(ui.available_height() * 0.35);
+                    let full = ui.available_rect_before_wrap();
+                    // Substrate: faint crosshair grid + HUD brackets.
+                    theme::grid(ui.painter(), full, 48.0, theme::BORDER.gamma_multiply(0.45));
+                    theme::brackets(ui.painter(), full.shrink(18.0), 26.0, theme::ACCENT_DIM);
+                    ui.add_space(full.height() * 0.30);
                     ui.vertical_centered(|ui| {
                         ui.label(
-                            RichText::new("Drop a video/audio file here, or browse on the left")
+                            egui::RichText::new("◇  NO SOURCE LOADED")
+                                .monospace()
+                                .size(15.0)
                                 .color(theme::MUTED),
                         );
+                        ui.add_space(6.0);
                         ui.label(
-                            RichText::new("Analyze detects flyover Doppler signatures; then set region + time and Process to locate")
-                                .color(theme::MUTED)
-                                .small(),
+                            egui::RichText::new("DROP A VIDEO / AUDIO FILE  ·  OR BROWSE FROM THE SOURCE PANEL")
+                                .monospace()
+                                .size(10.5)
+                                .color(theme::DIM),
+                        );
+                        ui.add_space(14.0);
+                        ui.label(
+                            egui::RichText::new("① ANALYSE  →  ② SET REGION + TIME WINDOW  →  ③ LOCATE")
+                                .monospace()
+                                .size(10.5)
+                                .color(theme::BORDER_HI),
                         );
                     });
                 }
@@ -1259,25 +1408,46 @@ impl App {
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
-        egui::Panel::bottom("status_bar").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                match &self.result {
-                    Some(r) => {
-                        ui.label(format!(
-                            "{} · {} Hz · {:.1}s · {} events · {}",
-                            r.source_path, r.sample_rate, r.duration_s, r.events.len(), r.backend
-                        ));
-                    }
-                    None => {
-                        ui.label("idle");
-                    }
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let backends = crate::decode::decoder_backend_available();
-                    ui.label(RichText::new(backends.join(" · ")).color(theme::MUTED).small());
+        egui::Panel::bottom("status_bar")
+            .frame(egui::Frame::new()
+                .fill(theme::VOID)
+                .inner_margin(egui::Margin::symmetric(12, 4)))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let (txt, col) = match &self.result {
+                        Some(r) => (
+                            format!(
+                                "{} · {} HZ · {:.1}S · {} EVENTS · {}",
+                                r.source_path, r.sample_rate, r.duration_s, r.events.len(), r.backend
+                            ),
+                            theme::TEXT,
+                        ),
+                        None => ("IDLE · NO SOURCE".to_string(), theme::DIM),
+                    };
+                    ui.label(
+                        egui::RichText::new(txt)
+                            .monospace()
+                            .size(10.0)
+                            .color(col),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let backends = crate::decode::decoder_backend_available();
+                        ui.label(
+                            egui::RichText::new(backends.join(" · "))
+                                .monospace()
+                                .size(9.5)
+                                .color(theme::DIM),
+                        );
+                        ui.add_space(10.0);
+                        ui.label(
+                            egui::RichText::new("AVALON / LOCAL")
+                                .monospace()
+                                .size(9.5)
+                                .color(theme::BORDER_HI),
+                        );
+                    });
                 });
             });
-        });
     }
 
     // -- map modal ----------------------------------------------------------
@@ -1306,7 +1476,7 @@ impl App {
                             if ui.button("✔ Apply region").clicked() {
                                 apply = true;
                             }
-                            if ui.button("Clear").clicked() {
+                            if ui.button("CLEAR").clicked() {
                                 clear = true;
                             }
                         }
@@ -1634,13 +1804,24 @@ fn fmt_duration(secs: f64) -> String {
 
 /// One labelled statistic tile.
 fn tile(ui: &mut egui::Ui, label: &str, value: &str) {
-    ui.vertical(|ui| {
-        ui.label(RichText::new(label).color(theme::MUTED).small());
-        ui.label(
-            RichText::new(value)
-                .color(theme::ACCENT_BRIGHT)
-                .monospace()
-                .size(15.0),
-        );
-    });
+    egui::Frame::new()
+        .fill(theme::PANEL)
+        .stroke(egui::Stroke::new(1.0, theme::BORDER))
+        .inner_margin(egui::Margin::symmetric(11, 7))
+        .show(ui, |ui| {
+            ui.set_min_size(egui::vec2(158.0, 42.0));
+            ui.label(
+                egui::RichText::new(label.to_uppercase())
+                    .monospace()
+                    .size(9.5)
+                    .color(theme::MUTED),
+            );
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new(value)
+                    .color(theme::TEXT)
+                    .monospace()
+                    .size(16.0),
+            );
+        });
 }
