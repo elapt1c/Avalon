@@ -299,14 +299,16 @@ pub fn run_search(
     };
     let radius_m = diag_km * 500.0 + 45_000.0;
     let (clat, clon) = bounds.center();
-    let mut tracks: Vec<(String, Track, Track)> = Vec::new(); // (icao, cpa grid, fine grid)
-    for f in &time_relevant {
-        if let Some(fine) = build_track(f, SCORE_DT, (clat, clon), radius_m) {
-            if let Some(coarse) = build_track(f, CPA_DT, (clat, clon), radius_m) {
-                tracks.push((f.icao.clone(), coarse, fine));
-            }
-        }
-    }
+    // Track building is pure per flight (clip the trace, resample twice), so it
+    // parallelises cleanly and was previously a single-core stage.
+    let tracks: Vec<(String, Track, Track)> = time_relevant
+        .par_iter()
+        .filter_map(|f| {
+            let fine = build_track(f, SCORE_DT, (clat, clon), radius_m)?;
+            let coarse = build_track(f, CPA_DT, (clat, clon), radius_m)?;
+            Some((f.icao.clone(), coarse, fine))
+        })
+        .collect();
     on_log(format!("{} usable tracks", tracks.len()));
 
     // Everything the scoring stage needs now lives in `tracks`; the parsed
@@ -910,18 +912,18 @@ fn score_cells(
     quality: Quality,
     window: (f64, f64),
 ) {
-    let results: Vec<(f32, f32, String)> = cells
-        .par_iter()
-        .map(|c| {
+    // Chunked so each worker amortises scheduling and keeps its scratch hot.
+    const CHUNK: usize = 32;
+    cells.par_chunks_mut(CHUNK).for_each(|chunk| {
+        for c in chunk {
             let cand = candidates_for(c.lat, c.lon);
-            score_cell(c.obs, (c.lat, c.lon), &cand, prepared, tracks, quality, window)
-        })
-        .collect();
-    for (c, (sc, rm, pair)) in cells.iter_mut().zip(results) {
-        c.score = sc;
-        c.rmse_hz = rm;
-        c.pair = pair;
-    }
+            let (sc, rm, pair) =
+                score_cell(c.obs, (c.lat, c.lon), &cand, prepared, tracks, quality, window);
+            c.score = sc;
+            c.rmse_hz = rm;
+            c.pair = pair;
+        }
+    });
 }
 
 trait CosExt {

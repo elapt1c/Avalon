@@ -31,12 +31,23 @@ pub fn init() {
         log(Level::Error, "panic", &info.to_string());
         default_hook(info);
     }));
+    // Worker-thread pool sized to the machine, and say so at startup: a silent
+    // single-threaded run looks identical to a slow algorithm.
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .max(1);
+    let _ = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(|i| format!("avalon-{i}"))
+        .build_global();
     log(
         Level::Info,
         "startup",
         &format!(
-            "logging at {:?}; {:.0} MB available",
+            "logging at {:?}; {} worker threads; {:.0} MB available",
             lvl,
+            rayon::current_num_threads(),
             available_bytes() as f64 / 1e6
         ),
     );

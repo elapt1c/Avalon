@@ -357,6 +357,12 @@ impl MapState {
         let scroll = ui.input(|i| i.smooth_scroll_delta.y) as f64;
         let cursor = resp.hover_pos().unwrap_or(rect.center());
         if resp.hovered() {
+            // Drop leftover scroll when the direction flips, otherwise the first
+            // notch the other way is swallowed by the previous notch's remainder
+            // (zoom in then out appeared to do nothing).
+            if (scroll > 0.0 && self.zoom_accum < 0.0) || (scroll < 0.0 && self.zoom_accum > 0.0) {
+                self.zoom_accum = 0.0;
+            }
             self.zoom_accum += scroll;
             while self.zoom_accum >= NOTCH_PX {
                 self.zoom_accum -= NOTCH_PX;
