@@ -34,6 +34,10 @@ pub enum Mode {
 struct Heat {
     bounds: Bounds,
     tex: TextureHandle,
+    /// Survivors as a point cloud: (lat, lon, confidence). Drawn as fixed-size
+    /// screen-space dots, so zooming in separates them instead of smearing the
+    /// field — the QGIS read: solid at a distance, individual points up close.
+    points: Vec<[f32; 3]>,
     survivors: usize,
     /// Best (lowest) residual among survivors, Hz — the legend's headline.
     best_rmse: f32,
@@ -274,6 +278,21 @@ impl MapState {
             }
         }
 
+        // Point cloud for the dot rendering (full resolution, not pooled).
+        let mut points: Vec<[f32; 3]> = Vec::with_capacity(survivors);
+        for cy in 0..rows {
+            for cx in 0..cols {
+                let v = vals[cy * cols + cx];
+                if v <= 0.0 {
+                    continue;
+                }
+                let conf = ((v - lo) / span).clamp(0.0, 1.0);
+                let lat = s + cy as f64 * step;
+                let lon = w + cx as f64 * step;
+                points.push([lat as f32, lon as f32, conf]);
+            }
+        }
+
         let image = egui::ColorImage::new([out_cols, out_rows], pixels);
         let handle = ctx.load_texture("search_heatmap", image, egui::TextureOptions::LINEAR);
         // Store the covered box, expanded by half a cell so cells sit centred.
@@ -285,6 +304,7 @@ impl MapState {
                 north: n + step / 2.0,
             },
             tex: handle,
+            points,
             survivors,
             best_rmse,
         });
@@ -773,9 +793,37 @@ impl MapState {
     fn draw_heatmap(&self, painter: &egui::Painter, rect: Rect) {
         let Some(heat) = &self.heat else { return };
         let Some(r) = self.bounds_to_screen_rect(heat.bounds, rect) else { return };
-        // Row 0 of the texture is south, so flip V: egui textures start at top.
-        let uv = Rect::from_min_max(Pos2::new(0.0, 1.0), Pos2::new(1.0, 0.0));
-        painter.image(heat.tex.id(), r, uv, Color32::WHITE);
+
+        // Dots, not a texture: every survivor is a fixed-size screen-space point,
+        // so a zoomed-out view reads as a solid field and a zoomed-in view
+        // resolves into individual samples (alpha lets the basemap through).
+        let mut mesh = egui::Mesh::default();
+        let mut drawn = 0usize;
+        for p in &heat.points {
+            let Some(pos) = self.latlon_screen(p[0] as f64, p[1] as f64, rect) else { continue };
+            if !rect.contains(pos) {
+                continue;
+            }
+            let conf = p[2].clamp(0.0, 1.0);
+            // Small screen-space dots (1.2-2.8 px): dense enough to read as a
+            // field when zoomed out, and they resolve into separate samples when
+            // zoomed in instead of growing into blocks.
+            let rad = 1.2 + 1.6 * conf;
+            let col = heat_color(conf);
+            let a = (120.0 + 115.0 * conf) as u8;
+            let fill = Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), a);
+            // Square texel per point, batched into one mesh: reads as dithering
+            // when zoomed out and as discrete samples when zoomed in.
+            mesh.add_colored_rect(
+                Rect::from_center_size(pos, egui::vec2(rad * 2.0, rad * 2.0)),
+                fill,
+            );
+            drawn += 1;
+        }
+        if drawn > 0 {
+            painter.add(egui::Shape::mesh(mesh));
+        }
+
         // Frame the searched box so its extent is legible on the basemap.
         painter.rect_stroke(
             r,
@@ -785,14 +833,10 @@ impl MapState {
         );
         // Legend: how many cells are on screen and what the scale spans. Without
         // this an empty-looking map is indistinguishable from a failed render.
-        let text = if heat.best_rmse.is_finite() {
-            format!(
-                "{} cells · best rmse {:.2} Hz · hot = best fit",
-                heat.survivors, heat.best_rmse
-            )
-        } else {
-            format!("{} cells · hot = best fit", heat.survivors)
-        };
+        let text = format!(
+            "{} cells · best rmse {:.2} Hz · bright = best fit",
+            heat.survivors, heat.best_rmse
+        );
         let pos = Pos2::new(rect.min.x + 10.0, rect.min.y + 24.0);
         painter.text(
             pos + egui::vec2(1.0, 1.0),
