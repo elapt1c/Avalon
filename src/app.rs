@@ -720,11 +720,14 @@ impl App {
                             .animate(true)
                             .text(format!("{:.0}%", fraction * 100.0)),
                     );
-                    ui.label(
-                        egui::RichText::new(text)
-                            .monospace()
-                            .size(10.0)
-                            .color(theme::TEXT),
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(text)
+                                .monospace()
+                                .size(10.0)
+                                .color(theme::TEXT),
+                        )
+                        .truncate(),
                     );
                 });
             });
@@ -920,11 +923,14 @@ impl App {
 
                 theme::section(ui, "log");
                 for line in &self.log {
-                    ui.label(
-                        egui::RichText::new(line)
-                            .monospace()
-                            .size(9.5)
-                            .color(theme::DIM),
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(line)
+                                .monospace()
+                                .size(9.5)
+                                .color(theme::DIM),
+                        )
+                        .truncate(),
                     );
                 }
 
