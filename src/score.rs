@@ -336,7 +336,86 @@ impl Track {
         Some([(b[0] - a[0]) / span, (b[1] - a[1]) / span, (b[2] - a[2]) / span])
     }
 
+    /// Time of **zero radial velocity** — the instant the aircraft crosses the
+    /// receiver's perpendicular, which is what an acoustic recording actually
+    /// measures (the Doppler shift passes through f0 there).
+    ///
+    /// This is NOT the closest-approach time for a turning aircraft: the
+    /// geometric CPA can sit seconds away from the radial zero, and the search
+    /// was pairing flyovers with the geometric version.
+    pub fn radial_zero(&self, obs: [f64; 3]) -> Option<(f64, f64)> {
+        self.radial_zero_near(obs, None)
+    }
+
+    /// As `radial_zero`, but prefers the crossing closest to `hint_t`. A track
+    /// that passes the receiver twice has several zero crossings; the first one
+    /// is often the wrong pass.
+    pub fn radial_zero_near(&self, obs: [f64; 3], hint_t: Option<f64>) -> Option<(f64, f64)> {
+        let n = self.pos.len();
+        if n < 3 {
+            return None;
+        }
+        let o = self.obs_offset(obs);
+        let mut crossings: Vec<(f64, f64)> = Vec::new(); // (time, distance)
+        let mut prev: Option<(f64, f64)> = None; // (vr, time)
+        for i in 1..n - 1 {
+            let p = self.pos[i];
+            let a = self.pos[i - 1];
+            let b = self.pos[i + 1];
+            // Relative position and velocity in the track's offset space.
+            let rx = p[0] as f64 - o[0];
+            let ry = p[1] as f64 - o[1];
+            let rz = p[2] as f64 - o[2];
+            let range = (rx * rx + ry * ry + rz * rz).sqrt();
+            if range < 1e-6 {
+                continue;
+            }
+            let vx = (b[0] - a[0]) as f64;
+            let vy = (b[1] - a[1]) as f64;
+            let vz = (b[2] - a[2]) as f64;
+            let vr = (vx * rx + vy * ry + vz * rz) / range;
+            let t = self.t0 + i as f64 * self.dt;
+            if let Some((vr0, t0)) = prev {
+                if (vr0 < 0.0) != (vr < 0.0) {
+                    // Linear interpolation of the sign change.
+                    let w = if (vr - vr0).abs() > 1e-12 {
+                        (-vr0 / (vr - vr0)).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    let tc = t0 + (t - t0) * w;
+                    let idx = ((tc - self.t0) / self.dt).clamp(0.0, (n - 1) as f64);
+                    let i0 = idx.floor() as usize;
+                    let i1 = (i0 + 1).min(n - 1);
+                    let f = idx - i0 as f64;
+                    let mut d2 = 0.0;
+                    for k in 0..3 {
+                        let v = self.pos[i0][k] as f64
+                            + (self.pos[i1][k] - self.pos[i0][k]) as f64 * f
+                            - o[k];
+                        d2 += v * v;
+                    }
+                    crossings.push((tc, d2.max(0.0).sqrt()));
+                }
+            }
+            prev = Some((vr, t));
+        }
+        if crossings.is_empty() {
+            return None;
+        }
+        let pick = match hint_t {
+            Some(h) => crossings
+                .into_iter()
+                .min_by(|a, b| {
+                    (a.0 - h).abs().partial_cmp(&(b.0 - h).abs()).unwrap_or(std::cmp::Ordering::Equal)
+                })?,
+            None => crossings[0],
+        };
+        Some((pick.1, pick.0))
+    }
+
     /// Coarse closest approach: scan every `stride`-th point, then refine in a
+
     /// local window. Scoring one cell against thousands of flights must not
     /// touch every sample, or the grid loop dominates runtime.
     pub fn cpa_stride(&self, obs: [f64; 3], stride: usize) -> Option<(f64, f64)> {

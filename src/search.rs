@@ -1197,7 +1197,16 @@ fn score_cell(
             let coarse_track = &tracks[ti as usize].1;
             let _ = cell;
             let stride = ((30.0 / coarse_track.dt.max(1e-3)) as usize).max(1);
-            let Some((d, t_cpa)) = coarse_track.cpa_stride(obs, stride) else { continue };
+            // Use the *acoustic* crossing (zero radial velocity) for the implied
+            // start, and the geometric distance only for the gates. Pairing on
+            // the geometric CPA mixed two different instants and cost ~10 s per
+            // event on a turning aircraft.
+            let geo = coarse_track.cpa_stride(obs, stride);
+            let (d, t_cpa) = match (geo, coarse_track.radial_zero_near(obs, geo.map(|g| g.1))) {
+                (Some((dg, tg)), Some((_dr, tr))) if (tr - tg).abs() < 120.0 => (dg, tr),
+                (Some(g), _) => g,
+                (None, _) => continue,
+            };
             // Loose geometric gate: any close pass is worth scoring.
             if d > 40_000.0 {
                 if is_debug_cell && gtracks::named(&tracks[ti as usize].0) {
