@@ -1,23 +1,39 @@
 //! Lightweight OpenStreetMap slippy map for egui: pan/zoom + rectangle region
-//! selection. Fetches raster tiles synchronously (cached, capped per frame).
+//! selection. Tiles are fetched on a background thread; the UI thread only
+//! uploads finished images, so panning and zooming never block on the network.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::mpsc::{ channel, Receiver, Sender };
 
 use egui::{Color32, Pos2, Rect, TextureHandle};
 
 use crate::model::{Bounds, HeatmapCell};
 
-/// Max new tiles fetched per frame (avoids long network stalls).
-const MAX_FETCH_PER_FRAME: usize = 6;
+/// Max tile requests in flight at once.
+const MAX_IN_FLIGHT: usize = 24;
 /// Max cached tile textures before a full clear.
 const MAX_CACHE: usize = 1024;
 /// Number of tiles at a given zoom (longitude axis).
 const TILE: f64 = 256.0;
+/// Heatmap raster is downsampled to at most this many texels per side.
+const HEAT_MAX_TEXELS: usize = 1024;
+
+type TileKey = (u32, u32, u32);
+type TileResult = (TileKey, Vec<u8>, (usize, usize));
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Mode {
     Pan,
     Select,
+}
+
+/// A rasterised candidate field drawn under the selection rectangles.
+struct Heat {
+    bounds: Bounds,
+    tex: TextureHandle,
+    survivors: usize,
+    /// Best (lowest) residual among survivors, Hz — the legend's headline.
+    best_rmse: f32,
 }
 
 pub struct MapState {
@@ -26,36 +42,62 @@ pub struct MapState {
     center_py: f64,
     zoom: f32,
     pub mode: Mode,
-    tile_cache: HashMap<(u32, u32, u32), TextureHandle>,
+    tile_cache: HashMap<TileKey, TextureHandle>,
+    /// Requests handed to the loader and not yet answered.
+    pending: HashSet<TileKey>,
+    /// Tiles the server refused; never retried, so we don't hammer it.
+    failed: HashSet<TileKey>,
+    tile_tx: Sender<TileKey>,
+    tile_rx: Receiver<TileResult>,
     rectangles: Vec<Bounds>,
-    /// Heatmap raster + the box it covers. Drawn as one textured quad:
-    /// per-cell rectangles overlap and alias into a moiré pattern.
-    heatmap: Option<(Bounds, TextureHandle)>,
+    heat: Option<Heat>,
     /// Optional ground-truth point drawn as a crosshair (accuracy check).
     marker: Option<(f64, f64)>,
     // interaction
     last_pointer: Option<Pos2>,
     draw_start: Option<Pos2>,
     draw_end: Option<Pos2>,
-    fetched_this_frame: usize,
 }
 
 impl MapState {
     pub fn new(lat: f64, lon: f64, zoom: f32) -> Self {
         let scale = TILE * 2f64.powi(zoom as i32);
+        let (req_tx, req_rx) = channel::<TileKey>();
+        let (res_tx, res_rx) = channel::<TileResult>();
+        // One loader thread per map; it lives as long as the app does.
+        std::thread::Builder::new()
+            .name("avalon-tiles".into())
+            .spawn(move || {
+                while let Ok(key) = req_rx.recv() {
+                    if let Some((bytes, dims)) = fetch_tile(key.0, key.1, key.2) {
+                        if res_tx.send((key, bytes, dims)).is_err() {
+                            break;
+                        }
+                    } else {
+                        // Signal failure with an empty payload.
+                        if res_tx.send((key, Vec::new(), (0, 0))).is_err() {
+                            break;
+                        }
+                    }
+                }
+            })
+            .ok();
         Self {
             center_px: lon_to_world_x(lon) * scale,
             center_py: lat_to_world_y(lat) * scale,
             zoom,
             mode: Mode::Pan,
             tile_cache: HashMap::new(),
+            pending: HashSet::new(),
+            failed: HashSet::new(),
+            tile_tx: req_tx,
+            tile_rx: res_rx,
             rectangles: Vec::new(),
-            heatmap: None,
+            heat: None,
             marker: None,
             last_pointer: None,
             draw_start: None,
             draw_end: None,
-            fetched_this_frame: 0,
         }
     }
 
@@ -72,11 +114,14 @@ impl MapState {
     }
 
     /// Rasterise the candidate grid once. Scoring spans orders of magnitude, so
-    /// the colour scale is normalised to the 2nd–98th percentile of the cells
-    /// that actually matched; otherwise one outlier flattens the whole map.
+    /// the colour scale is clipped to the 2nd–98th percentile of the cells that
+    /// actually matched; otherwise one outlier flattens the whole map.
+    ///
+    /// Confidence, not error, drives the colour: a cell whose fit is near the
+    /// best of the field is the one worth looking at, so it gets the hot end.
     pub fn set_heatmap(&mut self, ctx: &egui::Context, cells: &[HeatmapCell], step_deg: f64) {
         if cells.is_empty() {
-            self.heatmap = None;
+            self.heat = None;
             return;
         }
         let (mut w, mut s, mut e, mut n) = (
@@ -92,8 +137,8 @@ impl MapState {
             n = n.max(c.lat);
         }
         let step = step_deg.max(1e-4);
-        let cols = (((e - w) / step).round() as usize + 1).clamp(1, 2048);
-        let rows = (((n - s) / step).round() as usize + 1).clamp(1, 2048);
+        let cols = (((e - w) / step).round() as usize + 1).clamp(1, 4096);
+        let rows = (((n - s) / step).round() as usize + 1).clamp(1, 4096);
 
         // Split the grid: survivors carry a score, everything else is either an
         // elimination or unscored. Only survivors define the colour scale.
@@ -112,9 +157,15 @@ impl MapState {
 
         let mut sorted: Vec<f32> = vals.iter().copied().filter(|v| *v > 0.0).collect();
         if sorted.is_empty() {
-            self.heatmap = None;
+            self.heat = None;
             return;
         }
+        let survivors = sorted.len();
+        let best_rmse = cells
+            .iter()
+            .map(|c| c.rmse_hz)
+            .filter(|r| r.is_finite() && *r > 0.0)
+            .fold(f32::INFINITY, f32::min);
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let lo = sorted[((sorted.len() as f64 * 0.02) as usize).min(sorted.len() - 1)];
         let hi = sorted[((sorted.len() as f64 * 0.98) as usize).min(sorted.len() - 1)];
@@ -134,8 +185,10 @@ impl MapState {
                 if v <= 0.0 {
                     continue;
                 }
-                let t = ((v - lo) / span).clamp(0.0, 1.0);
-                let weight = 0.35 + 0.65 * t;
+                // score_hz is a composite where higher is better, so the
+                // normalised value *is* the confidence.
+                let conf = ((v - lo) / span).clamp(0.0, 1.0);
+                let weight = 0.30 + 0.70 * conf;
                 for dy in -RADIUS..=RADIUS {
                     let yy = cy as isize + dy;
                     if yy < 0 || yy >= rows as isize {
@@ -154,48 +207,103 @@ impl MapState {
             }
         }
 
-        let mut pixels = Vec::with_capacity(cols * rows);
-        for i in 0..cols * rows {
-            let v = field[i].min(1.0);
-            if v > 0.004 {
-                // Opaque core, fading skirt: the confidence ramp already encodes
-                // the value, so alpha only controls how solid the patch reads.
-                let c = heat_color(v);
-                let a = (120.0 + 135.0 * v.powf(0.5)) as u8;
-                pixels.push(Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a));
-            } else if elim[i] {
-                // Eliminated: green enough to read as "searched, nothing here"
-                // over the whole box, translucent enough to keep roads legible.
-                pixels.push(Color32::from_rgba_unmultiplied(58, 168, 96, 104));
-            } else {
-                pixels.push(Color32::TRANSPARENT);
+        // Max-pool down to a texture size every GPU accepts, keeping peaks.
+        let ds = ((cols.max(rows) as f64) / HEAT_MAX_TEXELS as f64).ceil().max(1.0) as usize;
+        let out_cols = cols.div_ceil(ds);
+        let out_rows = rows.div_ceil(ds);
+        let mut pixels = Vec::with_capacity(out_cols * out_rows);
+        for oy in 0..out_rows {
+            for ox in 0..out_cols {
+                let mut best = 0.0f32;
+                let mut any_elim = false;
+                for dy in 0..ds {
+                    let y = oy * ds + dy;
+                    if y >= rows {
+                        break;
+                    }
+                    for dx in 0..ds {
+                        let x = ox * ds + dx;
+                        if x >= cols {
+                            break;
+                        }
+                        let i = y * cols + x;
+                        best = best.max(field[i]);
+                        any_elim |= elim[i];
+                    }
+                }
+                if best > 0.004 {
+                    let v = best.min(1.0);
+                    let c = heat_color(v);
+                    let a = (150.0 + 105.0 * v.powf(0.6)) as u8;
+                    pixels.push(Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a));
+                } else if any_elim {
+                    // Eliminated: a faint wash so the searched box still reads as
+                    // "covered", without drowning the survivors.
+                    pixels.push(Color32::from_rgba_unmultiplied(58, 168, 96, 34));
+                } else {
+                    pixels.push(Color32::TRANSPARENT);
+                }
             }
         }
 
-        let image = egui::ColorImage::new([cols, rows], pixels);
+        let image = egui::ColorImage::new([out_cols, out_rows], pixels);
         let handle = ctx.load_texture("search_heatmap", image, egui::TextureOptions::LINEAR);
         // Store the covered box, expanded by half a cell so cells sit centred.
-        self.heatmap = Some((
-            Bounds {
+        self.heat = Some(Heat {
+            bounds: Bounds {
                 west: w - step / 2.0,
                 south: s - step / 2.0,
                 east: e + step / 2.0,
                 north: n + step / 2.0,
             },
-            handle,
-        ));
+            tex: handle,
+            survivors,
+            best_rmse,
+        });
     }
 
     pub fn set_marker(&mut self, p: Option<(f64, f64)>) {
         self.marker = p;
     }
 
+    /// True while tile requests are still outstanding (drives the busy strip).
+    pub fn tiles_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
     pub fn clear_heatmap(&mut self) {
-        self.heatmap = None;
+        self.heat = None;
+    }
+
+    /// Take delivery of whatever the loader finished. Never blocks.
+    fn drain_tiles(&mut self, ctx: &egui::Context) {
+        let mut got = false;
+        while let Ok((key, bytes, (w, h))) = self.tile_rx.try_recv() {
+            self.pending.remove(&key);
+            if bytes.is_empty() || w == 0 || h == 0 {
+                self.failed.insert(key);
+                continue;
+            }
+            let ci = egui::ColorImage::from_rgba_unmultiplied([w, h], &bytes);
+            let tex = ctx.load_texture(
+                format!("tile_{}_{}_{}", key.0, key.1, key.2),
+                ci,
+                egui::TextureOptions::LINEAR,
+            );
+            self.tile_cache.insert(key, tex);
+            got = true;
+        }
+        if self.tile_cache.len() > MAX_CACHE {
+            // Keep it simple: drop everything and let the visible set refetch.
+            self.tile_cache.clear();
+        }
+        if got {
+            ctx.request_repaint();
+        }
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        self.fetched_this_frame = 0;
+        self.drain_tiles(ctx);
 
         // Header: mode toggle + hint.
         ui.horizontal(|ui| {
@@ -230,8 +338,8 @@ impl MapState {
         // Pan / draw interaction.
         self.handle_pointer(resp, rect, ctx);
 
-        // Draw tiles.
-        self.draw_tiles(ctx, &painter, rect);
+        // Draw tiles (bounded work: cached ones paint, the rest queue).
+        self.draw_tiles(&painter, rect);
 
         // Draw selected rectangles + in-progress rectangle.
         self.draw_overlays(&painter, rect);
@@ -329,11 +437,15 @@ impl MapState {
         }
     }
 
-    fn draw_tiles(&mut self, ctx: &egui::Context, painter: &egui::Painter, rect: Rect) {
+    fn draw_tiles(&mut self, painter: &egui::Painter, rect: Rect) {
         let z = self.zoom.floor() as i32;
         let z = z.clamp(0, 19) as u32;
         let max_tile = (1i64 << z) as i64;
         let c = rect.center();
+
+        // Anchor for prioritising requests: centre of the viewport.
+        let acx = self.center_px / TILE;
+        let acy = self.center_py / TILE;
 
         let wpx0 = self.center_px - rect.width() as f64 / 2.0;
         let wpx1 = self.center_px + rect.width() as f64 / 2.0;
@@ -345,32 +457,41 @@ impl MapState {
         let ty0 = (wpy0 / TILE).floor() as i64;
         let ty1 = (wpy1 / TILE).floor() as i64;
 
+        // Collect what is missing, then queue the nearest ones first.
+        let mut missing: Vec<(i64, i64, f64)> = Vec::new();
         for ty in ty0..=ty1 {
             for tx in tx0..=tx1 {
                 if tx < 0 || tx >= max_tile || ty < 0 || ty >= max_tile {
                     continue;
                 }
                 let key = (z, tx as u32, ty as u32);
-                let tex_id = match self.tile_cache.get(&key) {
-                    Some(t) => t.id(),
-                    None => {
-                        if self.fetched_this_frame >= MAX_FETCH_PER_FRAME {
-                            continue;
-                        }
-                        self.fetched_this_frame += 1;
-                        match fetch_tile(ctx, z, tx as u32, ty as u32) {
-                            Some(t) => {
-                                self.tile_cache.insert(key, t);
-                                if self.tile_cache.len() > MAX_CACHE {
-                                    self.tile_cache.clear();
-                                }
-                                self.tile_cache.get(&key).unwrap().id()
-                            }
-                            None => continue,
-                        }
-                    }
-                };
+                if self.tile_cache.contains_key(&key)
+                    || self.pending.contains(&key)
+                    || self.failed.contains(&key)
+                {
+                    continue;
+                }
+                let d = (tx as f64 - acx).powi(2) + (ty as f64 - acy).powi(2);
+                missing.push((tx, ty, d));
+            }
+        }
+        missing.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+        for (tx, ty, _) in missing {
+            if self.pending.len() >= MAX_IN_FLIGHT {
+                break;
+            }
+            let key = (z, tx as u32, ty as u32);
+            if self.tile_tx.send(key).is_ok() {
+                self.pending.insert(key);
+            }
+        }
 
+        for ty in ty0..=ty1 {
+            for tx in tx0..=tx1 {
+                if tx < 0 || tx >= max_tile || ty < 0 || ty >= max_tile {
+                    continue;
+                }
+                let key = (z, tx as u32, ty as u32);
                 let left = tx as f64 * TILE - self.center_px + c.x as f64;
                 let right = (tx as f64 + 1.0) * TILE - self.center_px + c.x as f64;
                 let top = ty as f64 * TILE - self.center_py + c.y as f64;
@@ -379,17 +500,40 @@ impl MapState {
                     Pos2::new(left as f32, top as f32),
                     Pos2::new(right as f32, bottom as f32),
                 );
-                let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
-                painter.image(tex_id, screen, uv, Color32::WHITE);
+                match self.tile_cache.get(&key) {
+                    Some(tex) => {
+                        let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
+                        painter.image(tex.id(), screen, uv, Color32::WHITE);
+                    }
+                    None if self.failed.contains(&key) => {
+                        // Permanently unavailable: leave the panel background.
+                        painter.rect_filled(
+                            screen,
+                            0.0,
+                            crate::theme::BG.gamma_multiply(1.4),
+                        );
+                    }
+                    None => {
+                        // In flight: a neutral placeholder keeps the layout stable
+                        // instead of flashing holes while tiles arrive.
+                        painter.rect_filled(
+                            screen,
+                            0.0,
+                            crate::theme::PANEL.gamma_multiply(0.8),
+                        );
+                    }
+                }
             }
+        }
+        // Keep animating while requests are outstanding.
+        if !self.pending.is_empty() {
+            painter.ctx().request_repaint_after(std::time::Duration::from_millis(120));
         }
     }
 
     fn draw_overlays(&self, painter: &egui::Painter, rect: Rect) {
         // Heatmap first (under selection rectangles).
-        if self.heatmap.is_some() {
-            self.draw_heatmap(painter, rect);
-        }
+        self.draw_heatmap(painter, rect);
         let stroke = egui::Stroke::new(2.0, crate::theme::ACCENT_BRIGHT);
         for b in &self.rectangles {
             if let Some(r) = self.bounds_to_screen_rect(*b, rect) {
@@ -428,18 +572,42 @@ impl MapState {
     }
 
     fn draw_heatmap(&self, painter: &egui::Painter, rect: Rect) {
-        let Some((bounds, tex)) = &self.heatmap else { return };
-        let Some(r) = self.bounds_to_screen_rect(*bounds, rect) else { return };
-        let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
+        let Some(heat) = &self.heat else { return };
+        let Some(r) = self.bounds_to_screen_rect(heat.bounds, rect) else { return };
         // Row 0 of the texture is south, so flip V: egui textures start at top.
-        let uv = Rect::from_min_max(Pos2::new(uv.min.x, 1.0), Pos2::new(uv.max.x, 0.0));
-        painter.image(tex.id(), r, uv, Color32::WHITE);
+        let uv = Rect::from_min_max(Pos2::new(0.0, 1.0), Pos2::new(1.0, 0.0));
+        painter.image(heat.tex.id(), r, uv, Color32::WHITE);
         // Frame the searched box so its extent is legible on the basemap.
         painter.rect_stroke(
             r,
             0.0,
             egui::Stroke::new(1.0, crate::theme::ACCENT.gamma_multiply(0.6)),
             egui::StrokeKind::Middle,
+        );
+        // Legend: how many cells are on screen and what the scale spans. Without
+        // this an empty-looking map is indistinguishable from a failed render.
+        let text = if heat.best_rmse.is_finite() {
+            format!(
+                "{} cells · best rmse {:.2} Hz · hot = best fit",
+                heat.survivors, heat.best_rmse
+            )
+        } else {
+            format!("{} cells · hot = best fit", heat.survivors)
+        };
+        let pos = Pos2::new(rect.min.x + 10.0, rect.min.y + 24.0);
+        painter.text(
+            pos + egui::vec2(1.0, 1.0),
+            egui::Align2::LEFT_TOP,
+            &text,
+            egui::FontId::monospace(11.0),
+            Color32::from_black_alpha(200),
+        );
+        painter.text(
+            pos,
+            egui::Align2::LEFT_TOP,
+            text,
+            egui::FontId::monospace(11.0),
+            crate::theme::ACCENT_BRIGHT,
         );
     }
 
@@ -457,7 +625,8 @@ impl MapState {
     }
 }
 
-fn fetch_tile(ctx: &egui::Context, z: u32, x: u32, y: u32) -> Option<TextureHandle> {
+/// Runs on the loader thread: blocking HTTP + PNG decode, no egui involved.
+fn fetch_tile(z: u32, x: u32, y: u32) -> Option<(Vec<u8>, (usize, usize))> {
     // tile.openstreetmap.org usage policy: fine for light interactive use.
     let url = format!("https://tile.openstreetmap.org/{z}/{x}/{y}.png");
     let resp = ureq::get(&url).set("User-Agent", "avalon").call().ok()?;
@@ -466,12 +635,7 @@ fn fetch_tile(ctx: &egui::Context, z: u32, x: u32, y: u32) -> Option<TextureHand
     resp.into_reader().read_to_end(&mut bytes).ok()?;
     let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
     let (w, h) = img.dimensions();
-    let ci = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], img.as_raw());
-    Some(ctx.load_texture(
-        format!("tile_{z}_{x}_{y}"),
-        ci,
-        egui::TextureOptions::LINEAR,
-    ))
+    Some((img.into_raw(), (w as usize, h as usize)))
 }
 
 fn lon_to_world_x(lon: f64) -> f64 {
@@ -492,15 +656,15 @@ fn world_y_to_lat(y: f64) -> f64 {
     n.sinh().atan().to_degrees()
 }
 
-/// Heatmap color: t=0 (best) bright, t=1 (worst) dark.
+/// Confidence colour: 0 = barely above the noise floor, 1 = the best cell found.
 fn heat_color(t: f32) -> Color32 {
     let t = t.clamp(0.0, 1.0);
     let stops: [(f32, (u8, u8, u8)); 5] = [
-        (0.00, (70, 200, 110)),  // low confidence: green
-        (0.35, (240, 170, 50)),  // orange
-        (0.65, (225, 70, 50)),   // red
-        (0.85, (170, 60, 160)),  // magenta
-        (1.00, (110, 40, 190)),  // highest: purple
+        (0.00, (40, 70, 120)),    // cold: poor fit
+        (0.40, (60, 150, 180)),   // cyan
+        (0.65, (240, 190, 60)),   // amber
+        (0.85, (235, 90, 45)),    // red
+        (1.00, (255, 245, 210)),  // white-hot: best fit
     ];
     for i in 0..stops.len() - 1 {
         let (t0, c0) = stops[i];
@@ -513,5 +677,5 @@ fn heat_color(t: f32) -> Color32 {
             return Color32::from_rgb(r, g, b);
         }
     }
-    Color32::from_rgb(70, 25, 90)
+    Color32::from_rgb(255, 245, 210)
 }

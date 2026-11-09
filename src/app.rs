@@ -106,6 +106,8 @@ enum MapPurpose {
 
 pub struct App {
     selected_path: Option<PathBuf>,
+    /// Guard for the AVALON_HEAT_DEMO synthetic field.
+    demo_done: bool,
 
     // Intelligence.
     region: Vec<Bounds>,
@@ -182,6 +184,7 @@ impl App {
             auto_run,
             autostart,
             show_intel: false,
+            demo_done: false,
             selected_path: None,
             // No pre-filled region: the operator draws the search box. A stale
             // default quietly turns a "find it blind" run into a hint.
@@ -651,12 +654,76 @@ impl App {
             self.start_analysis();
         }
         self.top_bar(ui);
+        self.busy_strip(ui);
         self.source_panel(ui);
         if self.show_intel {
             self.intel_panel(ui);
         }
         self.status_bar(ui);
         self.central_panel(ui);
+    }
+
+    /// Always-on activity strip. Any long step (decode, analysis, locate, even
+    /// map tiles) keeps a spinner and a real progress bar on screen, because a
+    /// static window is indistinguishable from a hung one.
+    fn busy_strip(&mut self, ui: &mut egui::Ui) {
+        let analysis = match &self.analysis {
+            AnalysisState::Running { fraction, stage } => Some((*fraction, stage.clone())),
+            _ => None,
+        };
+        let searching = matches!(self.search, SearchState::Running { .. });
+        let tiles = self.map_open && self.map.tiles_pending();
+        if analysis.is_none() && !searching && !tiles {
+            return;
+        }
+
+        let (fraction, text): (f32, String) = if searching {
+            match &self.search_snapshot {
+                Some(s) => {
+                    let eta = if s.eta_s.is_finite() && s.eta_s > 0.0 {
+                        format!(" · ETA {:+.0}s", s.eta_s)
+                    } else {
+                        String::new()
+                    };
+                    (
+                        s.fraction.clamp(0.0, 1.0),
+                        format!(
+                            "{} · {} · {:.0} cells/s · {:.0}s{}",
+                            s.stage, s.detail, s.cells_per_s, s.elapsed_s, eta
+                        ),
+                    )
+                }
+                None => (0.0, "locate: starting…".to_string()),
+            }
+        } else if let Some((f, stage)) = analysis {
+            (f.clamp(0.0, 1.0), stage)
+        } else {
+            (1.0, "map tiles: loading…".to_string())
+        };
+
+        egui::Panel::top("busy_strip")
+            .frame(egui::Frame::new()
+                .fill(theme::PANEL)
+                .inner_margin(egui::Margin::symmetric(12, 5)))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add(egui::Spinner::new().size(13.0).color(theme::ACCENT_BRIGHT));
+                    ui.add(
+                        egui::ProgressBar::new(fraction)
+                            .desired_width(240.0)
+                            .animate(true)
+                            .text(format!("{:.0}%", fraction * 100.0)),
+                    );
+                    ui.label(
+                        egui::RichText::new(text)
+                            .monospace()
+                            .size(10.0)
+                            .color(theme::TEXT),
+                    );
+                });
+            });
+        // Keep the strip animating while anything is in flight.
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(80));
     }
 
     /// Instrument strip: wordmark, mission line, state, UTC clock.
@@ -1095,8 +1162,18 @@ impl App {
         match &self.search {
             SearchState::Running { stage } => {
                 let mut cancel = false;
+                let frac = self
+                    .search_snapshot
+                    .as_ref()
+                    .map(|s| s.fraction.clamp(0.0, 1.0))
+                    .unwrap_or(0.0);
                 ui.horizontal(|ui| {
-                    ui.add(egui::ProgressBar::new(0.0).text(stage));
+                    ui.add(egui::Spinner::new().size(13.0));
+                    ui.add(
+                        egui::ProgressBar::new(frac)
+                            .animate(true)
+                            .text(format!("{:.0}%  {stage}", frac * 100.0)),
+                    );
                     if ui.button("Stop").clicked() {
                         cancel = true;
                     }
@@ -1501,9 +1578,14 @@ impl App {
             MapPurpose::Region => "Select search region",
             MapPurpose::Heatmap => "Candidate heatmap",
         };
+        // Fill most of the window: the heatmap is the point of this view, and a
+        // small floating box makes a sparse field look empty.
+        let screen = ctx.content_rect();
         egui::Window::new(title)
-            .default_size([840.0, 620.0])
+            .default_size([screen.width() * 0.92, screen.height() * 0.88])
+            .default_pos([screen.min.x + screen.width() * 0.04, screen.min.y + 40.0])
             .min_size([400.0, 300.0])
+            .resizable(true)
             .open(&mut open)
             .show(ctx, |ui| {
                 // Action bar first, so it is always visible.
@@ -1530,7 +1612,7 @@ impl App {
                                 .unwrap_or(0);
                             ui.label(
                                 RichText::new(format!(
-                                    "{survivors} of {total} cells passed the hard filters · green = eliminated → orange → red → purple = highest"
+                                    "{survivors} of {total} scored cells survived · faint green = searched, nothing here · blue → amber → white-hot = best fit"
                                 ))
                                 .color(theme::MUTED),
                             );
@@ -1736,9 +1818,71 @@ impl App {
     }
 }
 
+impl App {
+    /// True when the map holds no candidate field yet (demo hook guard).
+    fn map_heat_none(&self) -> bool {
+        !self.demo_done
+    }
+
+    /// Synthetic 2-degree field with a few tight clusters, for eyeballing the
+    /// heatmap renderer. Only reachable with AVALON_HEAT_DEMO=1.
+    fn demo_heatmap(&mut self, ctx: &egui::Context) {
+        self.demo_done = true;
+        let step = 0.02f64;
+        let centres = [(40.88, -73.52), (41.30, -72.40), (40.20, -74.30)];
+        let mut cells = Vec::new();
+        for (clat, clon) in centres {
+            for i in -12..=12 {
+                for j in -12..=12 {
+                    let d = ((i * i + j * j) as f64).sqrt();
+                    if d > 12.0 {
+                        continue;
+                    }
+                    if (i + j) % 3 != 0 {
+                        continue;
+                    }
+                    cells.push(crate::model::HeatmapCell {
+                        lat: clat + i as f64 * step,
+                        lon: clon + j as f64 * step,
+                        score_hz: (1.0 + d * 0.8) as f32,
+                        rmse_hz: (1.5 + d * 0.35) as f32,
+                        pair: "demo".into(),
+                    });
+                }
+            }
+        }
+        // A wash of eliminations, like a real searched box.
+        for i in 0..60 {
+            for j in 0..60 {
+                if i % 3 == 0 && j % 3 == 0 {
+                    cells.push(crate::model::HeatmapCell {
+                        lat: 39.9 + i as f64 * step,
+                        lon: -74.6 + j as f64 * step,
+                        score_hz: 0.0,
+                        rmse_hz: f32::INFINITY,
+                        pair: String::new(),
+                    });
+                }
+            }
+        }
+        self.map = crate::map::MapState::new(40.9, -73.4, 8.0);
+        self.map.set_heatmap(ctx, &cells, step);
+        self.map.mode = crate::map::Mode::Pan;
+    }
+}
+
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // Dev aids: open the map immediately, and optionally paint a synthetic
+        // candidate field so the heatmap renderer can be checked without a run.
+        if std::env::var("AVALON_MAP").is_ok() && !self.map_open {
+            self.map_open = true;
+            self.map_purpose = MapPurpose::Heatmap;
+        }
+        if std::env::var("AVALON_HEAT_DEMO").is_ok() && self.map_heat_none() {
+            self.demo_heatmap(&ctx);
+        }
         self.poll_analysis(&ctx);
         self.poll_search(&ctx);
         self.handle_drop(&ctx);

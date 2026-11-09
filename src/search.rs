@@ -39,6 +39,13 @@ const LEVEL_PARENTS: usize = 12;
 const LEVEL_PARENTS_FIRST: usize = 200;
 /// Stop refining once cells are this close together.
 const TARGET_STEP_M: f64 = 60.0;
+/// Preferred level-0 spacing: score a candidate every 500 m.
+const DENSE_STEP_M: f64 = 500.0;
+/// Refinement stops before children get finer than this.
+const MIN_REFINE_STEP_M: f64 = 50.0;
+/// Cell budget for level 0. 500 m spacing is honoured wherever the region
+/// allows it; past this budget the grid has to stretch so a run stays finite.
+const MAX_LEVEL0_CELLS: usize = 400_000;
 /// Hard stop on refinement depth (5^6 = 15625 x per side).
 const MAX_LEVELS: usize = 6;
 /// Flights per event kept as pair candidates in one cell. Not a ranking:
@@ -393,7 +400,20 @@ pub fn run_search(
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(COARSE_CELLS)
         .max(64);
-    let mut step_m = level0_step_m(lat_extent_m, lon_extent_m, coarse_cells)
+    // Level-0 spacing: 500 m by default, stretched only when the region would
+    // blow past the cell budget. The old behaviour derived spacing purely from
+    // a fixed cell count, so a mid-size box silently started at 800 m and a
+    // continental one at 15 km — the map showed the coarse grid, not the answer.
+    let auto_step = level0_step_m(lat_extent_m, lon_extent_m, coarse_cells);
+    let dense_step = (lat_extent_m * lon_extent_m / MAX_LEVEL0_CELLS as f64)
+        .sqrt()
+        .max(DENSE_STEP_M);
+    let target = std::env::var("AOS_TARGET_STEP_M")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(TARGET_STEP_M);
+    let mut step_m = auto_step
+        .min(dense_step)
         .max(GRID_M)
         .max(min_step);
 
@@ -488,7 +508,7 @@ pub fn run_search(
         }
         let base = cells.len();
         cells.extend(frontier.drain(..));
-        if step_m <= TARGET_STEP_M || level >= MAX_LEVELS {
+        if step_m <= target || level >= MAX_LEVELS {
             break;
         }
         let n_parents = if level == 0 { LEVEL_PARENTS_FIRST } else { LEVEL_PARENTS };
@@ -498,6 +518,15 @@ pub fn run_search(
             break;
         }
         let child_step = step_m / LEVEL_SPLIT as f64;
+        // The score kernel is ~1 km wide, so sub-50 m cells add nothing but
+        // cost. On a dense level-0 grid this is what used to spend minutes
+        // scoring an 11 m grid to move the answer by metres.
+        if child_step < MIN_REFINE_STEP_M {
+            on_log(format!(
+                "stopping refinement: next level would be {child_step:.0} m (< {MIN_REFINE_STEP_M:.0} m adds nothing)"
+            ));
+            break;
+        }
         let children = children_of(&cells[base..], &parents, child_step, &bounds);
         crate::log::info(
             "search",
