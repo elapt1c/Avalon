@@ -63,7 +63,7 @@ pub struct MapState {
     cam_to: Option<(f64, f64, f32)>,
     cam_t: f32,
     /// Live peaks (lat, lon, score) drawn as HUD markers while solving.
-    pub peaks: Vec<([f32; 3])>,
+    pub peaks: Vec<[f32; 3]>,
     /// Final answer, highlighted when the run finishes.
     pub winner: Option<(f64, f64)>,
     // interaction
@@ -687,47 +687,55 @@ impl MapState {
         }
         if let Some((lat, lon)) = self.winner {
             if let Some(pos) = self.latlon_screen(lat, lon, rect) {
-                // Winner: pulsing ring, drawn from wall-clock so it breathes.
                 let t = painter.ctx().input(|i| i.time) as f32;
-                let pulse = 0.5 + 0.5 * (t * 2.4).sin();
-                let r = 18.0 + 10.0 * pulse;
-                painter.circle_stroke(
-                    pos,
-                    r,
-                    egui::Stroke::new(2.0, Color32::from_rgb(150, 60, 210).gamma_multiply(0.85)),
-                );
-                painter.circle_stroke(
-                    pos,
-                    6.0 + 2.0 * pulse,
-                    egui::Stroke::new(2.0, Color32::from_rgb(255, 255, 255)),
-                );
-                painter.line_segment(
-                    [Pos2::new(pos.x - 26.0, pos.y), Pos2::new(pos.x - 8.0, pos.y)],
-                    egui::Stroke::new(1.5, Color32::WHITE),
-                );
-                painter.line_segment(
-                    [Pos2::new(pos.x + 8.0, pos.y), Pos2::new(pos.x + 26.0, pos.y)],
-                    egui::Stroke::new(1.5, Color32::WHITE),
-                );
-                painter.text(
-                    Pos2::new(pos.x + 30.0, pos.y - 10.0),
-                    egui::Align2::LEFT_TOP,
-                    "LOCK",
+                let pulse = 0.5 + 0.5 * (t * 2.2).sin();
+                // Brackets [ ] around the answer, sized to breathe slightly.
+                let half = 26.0 + 3.0 * pulse;
+                let arm = 12.0;
+                let ink = Color32::from_rgb(255, 255, 255);
+                let halo = Color32::from_black_alpha(200);
+                for (thick, col) in [(4.0, halo), (1.8, ink)] {
+                    // Left bracket
+                    for (a, b) in [
+                        (Pos2::new(-half, -half), Pos2::new(-half + arm, -half)),
+                        (Pos2::new(-half, -half), Pos2::new(-half, -half + arm)),
+                        (Pos2::new(-half, half), Pos2::new(-half + arm, half)),
+                        (Pos2::new(-half, half), Pos2::new(-half, half - arm)),
+                        // Right bracket
+                        (Pos2::new(half, -half), Pos2::new(half - arm, -half)),
+                        (Pos2::new(half, -half), Pos2::new(half, -half + arm)),
+                        (Pos2::new(half, half), Pos2::new(half - arm, half)),
+                        (Pos2::new(half, half), Pos2::new(half, half - arm)),
+                    ] {
+                        painter.line_segment(
+                            [Pos2::new(pos.x + a.x, pos.y + a.y), Pos2::new(pos.x + b.x, pos.y + b.y)],
+                            egui::Stroke::new(thick, col),
+                        );
+                    }
+                }
+                // Secondary dot so the exact cell is unambiguous inside the box.
+                painter.circle_filled(pos, 2.5, ink);
+
+                // Label: inverted chip (dark text on a bright plate) so it reads
+                // against any basemap underneath.
+                let label = "— LOCK";
+                let galley = painter.layout_no_wrap(
+                    label.to_string(),
                     egui::FontId::monospace(12.0),
-                    Color32::WHITE,
+                    Color32::from_rgb(6, 12, 20),
                 );
+                let pad = egui::vec2(7.0, 3.0);
+                let at = Pos2::new(pos.x + half + 10.0, pos.y - (galley.size().y + pad.y * 2.0) * 0.5);
+                painter.rect_filled(
+                    egui::Rect::from_min_size(at, galley.size() + pad * 2.0),
+                    2.0,
+                    Color32::from_rgb(190, 235, 255),
+                );
+                painter.galley(at + pad, galley, Color32::from_rgb(6, 12, 20));
                 painter.ctx().request_repaint();
             }
         }
 
-        // Basemap attribution, bottom-right (required by OSM/CARTO).
-        painter.text(
-            Pos2::new(rect.max.x - 8.0, rect.max.y - 6.0),
-            egui::Align2::RIGHT_BOTTOM,
-            "© OpenStreetMap · CARTO",
-            egui::FontId::monospace(9.0),
-            Color32::from_white_alpha(120),
-        );
         // Zoom readout, bottom-left: the header row can be crowded out.
         painter.text(
             Pos2::new(rect.max.x - 10.0, rect.min.y + 24.0),
@@ -882,13 +890,14 @@ fn world_y_to_lat(y: f64) -> f64 {
 /// operator expects: purple is the answer.
 fn heat_color(t: f32) -> Color32 {
     let t = t.clamp(0.0, 1.0);
-    let stops: [(f32, (u8, u8, u8)); 6] = [
-        (0.00, (40, 190, 90)),   // green: weakest survivor
-        (0.30, (60, 200, 160)),  // teal
-        (0.50, (60, 140, 200)),  // blue
-        (0.72, (230, 170, 60)),  // amber
-        (0.88, (230, 80, 60)),   // red
-        (1.00, (150, 60, 210)),  // purple: maximum confidence
+    // Cold scheme to sit on the blue-on-black UI: deep navy -> steel -> cyan ->
+    // ice -> near-white lilac at maximum confidence.
+    let stops: [(f32, (u8, u8, u8)); 5] = [
+        (0.00, (18, 44, 82)),
+        (0.35, (30, 92, 150)),
+        (0.62, (64, 156, 206)),
+        (0.85, (140, 214, 240)),
+        (1.00, (226, 242, 255)),
     ];
     for i in 0..stops.len() - 1 {
         let (t0, c0) = stops[i];
@@ -901,5 +910,6 @@ fn heat_color(t: f32) -> Color32 {
             return Color32::from_rgb(r, g, b);
         }
     }
-    Color32::from_rgb(150, 60, 210)
+    Color32::from_rgb(226, 242, 255)
 }
+

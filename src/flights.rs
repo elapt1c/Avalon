@@ -197,7 +197,7 @@ pub fn fetch_flights(
         // measuring the speedup (and for bit-identical ordering if ever needed).
         let parse_batch = if std::env::var("AVALON_PARSE_SERIAL").is_ok() { 1 } else { 64 };
         let mut batch: Vec<Vec<u8>> = Vec::with_capacity(parse_batch);
-        let mut flush = |batch: &mut Vec<Vec<u8>>, flights: &mut Vec<Flight>| {
+        let flush = |batch: &mut Vec<Vec<u8>>, flights: &mut Vec<Flight>| {
             if batch.is_empty() {
                 return;
             }

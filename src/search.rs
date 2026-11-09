@@ -1704,10 +1704,6 @@ fn score_pair(
     // biased — which is exactly what the reference case does (14 s apart).
     // Allow the two events to use different shifts, paying a small penalty per
     // second of disagreement so a genuinely shared clock still wins.
-    let penalty_hz_per_s = std::env::var("AOS_OFFSET_PENALTY")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(0.02);
     // Shared shift only. A per-event offset variant was tried and measured on the
     // reference case: truth-cell score 0.001 either way, and 411 s vs 286 s. The
     // mismatch is not purely a timing offset, so the extra freedom buys nothing.

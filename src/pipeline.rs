@@ -223,7 +223,6 @@ fn analyse_blocks(
     // to 20 % saves 15 s of the 56 s analysis but loses 9 of 37 ridges and 3 of
     // 17 events, i.e. it buys speed by missing weak flyovers. Keep the accuracy.
     let overlap_s = (block_s / 2.0).max(10.0);
-    let step = (block_s - overlap_s).max(1.0);
     crate::log::info(
         "pipeline",
         &format!(

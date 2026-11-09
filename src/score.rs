@@ -488,14 +488,6 @@ impl Track {
     }
 }
 
-#[inline]
-fn sq_dist(a: [f64; 3], b: [f64; 3]) -> f64 {
-    let dx = a[0] - b[0];
-    let dy = a[1] - b[1];
-    let dz = a[2] - b[2];
-    dx * dx + dy * dy + dz * dz
-}
-
 /// Squared distance between a track offset (f32) and an observer offset (f64,
 /// both relative to the track origin).
 #[inline]
