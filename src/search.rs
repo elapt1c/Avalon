@@ -1336,22 +1336,40 @@ fn score_cell(
             let mut ok = true;
             for (k, ti) in [(0usize, i0), (1usize, i1)] {
                 let spec = &prepared[k].spec;
-                match score::curve_rmse_offset(
-                    &prepared[k].coarse_curve,
-                    &tracks[ti].2,
-                    obs,
-                    spec.f0 as f64,
-                    base0,
-                    0.0,
-                    0.0,
-                    Atmos::default(),
-                    40.0,
-                ) {
-                    Some(v) => cost += v,
-                    None => {
-                        ok = false;
-                        break;
+                // Sweep f0 here, not just at the audio's own estimate. The true
+                // blade-pass rate can be several percent off the audio fit (the
+                // reference pair sits at 113.6 and 126.3 Hz against a fit of
+                // 119.6 / 136.6), and ranking on a single f0 then discards the
+                // correct pair before the full sweep ever sees it.
+                let mut best_k = f64::INFINITY;
+                // Sweep f0 AND a small clock offset here. Ranking every pair at
+                // shift 0 penalised exactly the pairs whose audio CPA is a few
+                // seconds off — which is all of them, and the reference pair
+                // worst of all (its two events imply starts 20 s apart).
+                for f0 in score::f0_grid_rel(spec.f0 as f64, 3, 0.12) {
+                    for sh in [-20.0, 0.0, 20.0] {
+                        if let Some(v) = score::curve_rmse_offset(
+                            &prepared[k].coarse_curve,
+                            &tracks[ti].2,
+                            obs,
+                            f0,
+                            base0,
+                            sh,
+                            0.0,
+                            Atmos::default(),
+                            40.0,
+                        ) {
+                            if v < best_k {
+                                best_k = v;
+                            }
+                        }
                     }
+                }
+                if best_k.is_finite() {
+                    cost += best_k;
+                } else {
+                    ok = false;
+                    break;
                 }
             }
             if ok {
@@ -1576,12 +1594,29 @@ fn score_pair(
     // Shared shift only. A per-event offset variant was tried and measured on the
     // reference case: truth-cell score 0.001 either way, and 411 s vs 286 s. The
     // mismatch is not purely a timing offset, so the extra freedom buys nothing.
+    // The two flyovers share one recording start, but each audio CPA time is
+    // estimated separately; on the reference case they disagree by 14 s, which a
+    // single shared shift cannot represent. Score every (event0, event1) shift
+    // pair and charge a small penalty per second of disagreement, so a genuinely
+    // shared clock still beats a split one. This is a combination over residuals
+    // already computed above — no extra curve evaluations.
+    let penalty = std::env::var("AOS_OFFSET_PENALTY")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(0.02);
     let mut best = f32::NEG_INFINITY;
     let mut best_rmse = f64::INFINITY;
     for i in 0..shifts.len() {
-        if r0[i].is_finite() && r1[i].is_finite() {
-            let mean = (r0[i] + r1[i]) / 2.0;
-            let s = (1.0 / (1.0 + mean)) as f32;
+        if !r0[i].is_finite() {
+            continue;
+        }
+        for j in 0..shifts.len() {
+            if !r1[j].is_finite() {
+                continue;
+            }
+            let mean = (r0[i] + r1[j]) / 2.0;
+            let split = (shifts[i] - shifts[j]).abs() * penalty;
+            let s = (1.0 / (1.0 + mean + split)) as f32;
             if s > best {
                 best = s;
                 best_rmse = mean;
