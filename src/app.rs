@@ -1633,7 +1633,7 @@ impl App {
                                 .unwrap_or(0);
                             ui.label(
                                 RichText::new(format!(
-                                    "{survivors} of {total} scored cells survived · faint green = searched, nothing here · blue → amber → white-hot = best fit"
+                                    "{survivors} of {total} scored cells survived · faint green = searched, nothing here · green → purple = most likely receiver"
                                 ))
                                 .color(theme::MUTED),
                             );

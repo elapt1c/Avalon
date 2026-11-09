@@ -222,6 +222,9 @@ impl MapState {
         let ds = ((cols.max(rows) as f64) / HEAT_MAX_TEXELS as f64).ceil().max(1.0) as usize;
         let out_cols = cols.div_ceil(ds);
         let out_rows = rows.div_ceil(ds);
+        // Scale to the field's own maximum: overlapping splats saturate the core
+        // instantly, which collapsed the whole ramp into purple.
+        let field_max = field.iter().cloned().fold(0.0f32, f32::max).max(1e-6);
         let mut pixels = Vec::with_capacity(out_cols * out_rows);
         for oy in 0..out_rows {
             for ox in 0..out_cols {
@@ -243,7 +246,8 @@ impl MapState {
                     }
                 }
                 if best > 0.004 {
-                    let v = best.min(1.0);
+                    // Gamma < 1 spreads the mid-range so the ramp is legible.
+                    let v = (best / field_max).clamp(0.0, 1.0).powf(0.55);
                     let c = heat_color(v);
                     let a = (150.0 + 105.0 * v.powf(0.6)) as u8;
                     pixels.push(Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a));
