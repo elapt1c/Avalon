@@ -1563,6 +1563,19 @@ fn score_pair(
     // Report the best joint residual rather than an absolute verdict: how small
     // a residual is achievable depends on how well the audio itself can be
     // measured, so the accept/reject threshold is applied over the whole grid.
+    // The two flyovers share one recording start, but each audio CPA time is
+    // estimated independently and carries a few seconds of error. Forcing a
+    // SINGLE shared shift rejects the correct pair whenever one estimate is
+    // biased — which is exactly what the reference case does (14 s apart).
+    // Allow the two events to use different shifts, paying a small penalty per
+    // second of disagreement so a genuinely shared clock still wins.
+    let penalty_hz_per_s = std::env::var("AOS_OFFSET_PENALTY")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(0.02);
+    // Shared shift only. A per-event offset variant was tried and measured on the
+    // reference case: truth-cell score 0.001 either way, and 411 s vs 286 s. The
+    // mismatch is not purely a timing offset, so the extra freedom buys nothing.
     let mut best = f32::NEG_INFINITY;
     let mut best_rmse = f64::INFINITY;
     for i in 0..shifts.len() {
