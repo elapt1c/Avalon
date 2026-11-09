@@ -489,15 +489,13 @@ impl App {
                         self.solve_map.peaks.clear();
                     }
                     if let Some(best) = result.best.first() {
-                        let err = haversine_m((best.lat, best.lon), TRUTH) / 1000.0;
                         crate::log::info(
                             "result",
                             &format!(
-                                "best {:.4},{:.4} score {:.2} · {:.1} km from truth · {} of {} cells survived",
+                                "best {:.4},{:.4} score {:.2} · {} of {} cells survived",
                                 best.lat,
                                 best.lon,
                                 best.score_hz,
-                                err,
                                 result.cells.iter().filter(|c| c.score_hz > 0.0).count(),
                                 result.cells.len()
                             ),
@@ -505,7 +503,9 @@ impl App {
                     }
                     self.search_result = Some(result);
                     self.search = SearchState::Done;
-                    self.map.set_marker(Some(TRUTH));
+                    // No ground-truth crosshair: for any clip other than the
+                    // reference file it is a second, unexplained marker.
+                    self.map.set_marker(None);
                     open_map = true;
                 }
                 Ok(SearchMsg::Error(e)) => {
@@ -1274,7 +1274,7 @@ impl App {
             self.map = MapState::new(lat, lon, zoom);
         }
         self.map.set_heatmap(ctx, &res.cells, res.step_deg);
-        self.map.set_marker(Some(TRUTH));
+        self.map.set_marker(None);
         self.map.mode = Mode::Pan;
         self.map_purpose = MapPurpose::Heatmap;
         self.map_open = true;

@@ -720,6 +720,14 @@ impl MapState {
             }
         }
 
+        // Basemap attribution, bottom-right (required by OSM/CARTO).
+        painter.text(
+            Pos2::new(rect.max.x - 8.0, rect.max.y - 6.0),
+            egui::Align2::RIGHT_BOTTOM,
+            "© OpenStreetMap · CARTO",
+            egui::FontId::monospace(9.0),
+            Color32::from_white_alpha(120),
+        );
         // Zoom readout, bottom-left: the header row can be crowded out.
         painter.text(
             Pos2::new(rect.max.x - 10.0, rect.min.y + 24.0),
@@ -809,16 +817,46 @@ impl MapState {
 }
 
 /// Runs on the loader thread: blocking HTTP + PNG decode, no egui involved.
+/// Basemap style. The default is a night map: a light-on-light basemap under a
+/// dark UI looks like a web page pasted into the window.
+fn tile_style() -> String {
+    std::env::var("AVALON_TILES").unwrap_or_else(|_| "osm-night".into())
+}
+
 fn fetch_tile(z: u32, x: u32, y: u32) -> Option<(Vec<u8>, (usize, usize))> {
-    // tile.openstreetmap.org usage policy: fine for light interactive use.
-    let url = format!("https://tile.openstreetmap.org/{z}/{x}/{y}.png");
-    let resp = ureq::get(&url).set("User-Agent", "avalon").call().ok()?;
+    let style = tile_style();
+    let url = match style.as_str() {
+        // CARTO's dark basemap now watermarks tiles without an API key, so it is
+        // opt-in only: set AVALON_TILES=night and a key on the URL if you have one.
+        "night" | "dark" => format!("https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png"),
+        // Same tiles as below, tinted locally at runtime.
+        "osm-night" => format!("https://tile.openstreetmap.org/{z}/{x}/{y}.png"),
+        _ => format!("https://tile.openstreetmap.org/{z}/{x}/{y}.png"),
+    };
+    let resp = ureq::get(&url)
+        .set("User-Agent", "avalon (geolocation research)")
+        .call()
+        .ok()?;
     let mut bytes = Vec::new();
     use std::io::Read;
     resp.into_reader().read_to_end(&mut bytes).ok()?;
     let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
     let (w, h) = img.dimensions();
-    Some((img.into_raw(), (w as usize, h as usize)))
+    let mut raw = img.into_raw();
+
+    // Local night filter for the OSM fallback: invert luminance, then tint the
+    // result a cold blue so it sits under the UI's cyan accents.
+    if style == "osm-night" {
+        for px in raw.chunks_mut(4) {
+            let lum = (0.2126 * px[0] as f32 + 0.7152 * px[1] as f32 + 0.0722 * px[2] as f32) / 255.0;
+            // Compress the range so roads stay visible without glare.
+            let v = (1.0 - lum).powf(0.85) * 0.72;
+            px[0] = (v * 150.0 + 8.0) as u8;
+            px[1] = (v * 178.0 + 12.0) as u8;
+            px[2] = (v * 205.0 + 22.0) as u8;
+        }
+    }
+    Some((raw, (w as usize, h as usize)))
 }
 
 fn lon_to_world_x(lon: f64) -> f64 {
