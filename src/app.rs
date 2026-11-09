@@ -717,7 +717,7 @@ impl App {
                     ui.add(
                         egui::ProgressBar::new(fraction)
                             .desired_width(240.0)
-                            .animate(true)
+                            .animate(fraction <= 0.0)
                             .text(format!("{:.0}%", fraction * 100.0)),
                     );
                     ui.add(
@@ -1180,10 +1180,11 @@ impl App {
                     .map(|s| s.fraction.clamp(0.0, 1.0))
                     .unwrap_or(0.0);
                 ui.horizontal(|ui| {
-                    ui.add(egui::Spinner::new().size(13.0));
+                    // No spinner here — the busy strip already shows one, and two
+                    // rotating indicators for one job read as two jobs.
                     ui.add(
                         egui::ProgressBar::new(frac)
-                            .animate(true)
+                            .animate(frac <= 0.0)
                             .text(format!("{:.0}%  {stage}", frac * 100.0)),
                     );
                     if ui.button("Stop").clicked() {
@@ -1493,10 +1494,25 @@ impl App {
             }
             match &self.analysis {
                 AnalysisState::Running { fraction, stage } => {
+                    // The busy strip under the top bar already carries the
+                    // spinner and the percentage; repeating them here made one
+                    // job look like two.
+                    let _ = fraction;
                     ui.add_space(ui.available_height() * 0.4);
                     ui.vertical_centered(|ui| {
-                        ui.heading(RichText::new(stage).color(theme::TEXT));
-                        ui.add(egui::ProgressBar::new(*fraction).desired_width(360.0).text(format!("{:.0}%", fraction * 100.0)));
+                        ui.label(
+                            RichText::new(stage.to_uppercase())
+                                .monospace()
+                                .size(13.0)
+                                .color(theme::MUTED),
+                        );
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new("working — see the status strip above")
+                                .monospace()
+                                .size(10.0)
+                                .color(theme::DIM),
+                        );
                     });
                 }
                 AnalysisState::Error(e) => {
