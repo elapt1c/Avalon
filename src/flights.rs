@@ -188,6 +188,28 @@ pub fn fetch_flights(
         prog.asset = format!("parsing {tag}");
         let day_start = flights.len();
         let mut last_emit = std::time::Instant::now();
+        // Reading the tar is inherently serial, but every member is an
+        // independently gzipped JSON document, so gunzip + parse is pure
+        // per-member work. Batch the reads and hand each batch to the pool:
+        // parsing used to run on one core while the other three sat idle.
+        use rayon::prelude::*;
+        // AVALON_PARSE_SERIAL=1 restores the old one-at-a-time behaviour, for
+        // measuring the speedup (and for bit-identical ordering if ever needed).
+        let parse_batch = if std::env::var("AVALON_PARSE_SERIAL").is_ok() { 1 } else { 64 };
+        let mut batch: Vec<Vec<u8>> = Vec::with_capacity(parse_batch);
+        let mut flush = |batch: &mut Vec<Vec<u8>>, flights: &mut Vec<Flight>| {
+            if batch.is_empty() {
+                return;
+            }
+            let t0f = t0 as f64;
+            let t1f = t1 as f64;
+            let parsed: Vec<Flight> = batch
+                .par_iter()
+                .filter_map(|raw| parse_trace(raw, region, t0f, t1f))
+                .collect();
+            flights.extend(parsed);
+            batch.clear();
+        };
         for entry in entries {
             if cancel.load(Ordering::Relaxed) {
                 return Err(anyhow!("cancelled"));
@@ -202,15 +224,18 @@ pub fn fetch_flights(
                 .read_to_end(&mut raw)
                 .context("reading trace member")?;
             prog.traces_seen += 1;
-            if let Some(flight) = parse_trace(&raw, region, t0 as f64, t1 as f64) {
-                flights.push(flight);
-            }
-            prog.flights_kept = flights.len();
-            if last_emit.elapsed().as_secs_f64() >= PROGRESS_INTERVAL_S {
-                last_emit = std::time::Instant::now();
-                on_progress(prog.clone());
+            batch.push(raw);
+            if batch.len() >= parse_batch {
+                flush(&mut batch, &mut flights);
+                prog.flights_kept = flights.len();
+                if last_emit.elapsed().as_secs_f64() >= PROGRESS_INTERVAL_S {
+                    last_emit = std::time::Instant::now();
+                    on_progress(prog.clone());
+                }
             }
         }
+        flush(&mut batch, &mut flights);
+        prog.flights_kept = flights.len();
         // Persist everything parsed for this day (unfiltered by region) so any
         // later search over these days loads in seconds.
         let day_flights = &flights[day_start..];
