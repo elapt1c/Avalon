@@ -19,7 +19,10 @@ use crate::pipeline::{self, Progress};
 use crate::search;
 use crate::theme;
 
-const PROVIDERS: [&str; 3] = ["staging-0", "prod-0", "mlatonly"];
+// Archive "pods" published by adsb.lol for each day. staging-0 and prod-0 are
+// the same volume of data from different ingest pipelines; mlatonly carries only
+// multilateration fixes, so it is ~8 % the size and misses ADS-B-only traffic.
+const PROVIDERS: [&str; 3] = ["staging-0", "prod-0", "mlatonly-0"];
 
 /// Which year the test window refers to (override with AVALON_YEAR).
 fn default_year() -> i64 {
@@ -290,7 +293,10 @@ impl App {
         // The worker runs on another thread; without an explicit repaint the UI
         // sits idle until some input arrives, so progress only appeared to move
         // when the pointer touched the window.
-        ctx.request_repaint_after(std::time::Duration::from_millis(40));
+        // Unconditional repaint: request_repaint_after can be coalesced away by
+        // some window systems, which is what left the progress bar frozen until
+        // the pointer moved over the window.
+        ctx.request_repaint();
         let mut autorun_ids: Option<Vec<usize>> = None;
         loop {
             match rx.try_recv() {
@@ -440,7 +446,7 @@ impl App {
 
     fn poll_search(&mut self, ctx: &egui::Context) {
         let Some(rx) = &self.search_rx else { return };
-        ctx.request_repaint_after(std::time::Duration::from_millis(60));
+        ctx.request_repaint();
         let mut got_progress = false;
         let mut open_map = false;
         loop {
@@ -1397,7 +1403,7 @@ impl App {
         ];
         egui::Grid::new("proc_tiles")
             .num_columns(4)
-            .spacing([10.0, 10.0])
+            .spacing([18.0, 14.0])
             .show(ui, |ui| {
                 for (i, (label, value)) in tiles.iter().enumerate() {
                     tile(ui, label, value);
@@ -1416,8 +1422,9 @@ impl App {
             );
         }
 
-        ui.add_space(10.0);
+        ui.add_space(18.0);
         ui.label(RichText::new("Best residual over grid progress").color(theme::MUTED).small());
+        ui.add_space(8.0);
         // Sparkline of the real running best; cheap (<=512 points, no axes).
         let pts: Vec<[f64; 2]> = self
             .score_history
@@ -1447,8 +1454,9 @@ impl App {
             ui.allocate_space(egui::vec2(ui.available_width(), height));
         }
 
-        ui.add_space(6.0);
+        ui.add_space(18.0);
         ui.label(RichText::new("Log").color(theme::MUTED).small());
+        ui.add_space(6.0);
         egui::ScrollArea::vertical()
             .max_height(ui.available_height().max(40.0))
             .stick_to_bottom(true)

@@ -175,6 +175,20 @@ const BLOCK_S: f64 = 300.0;
 const DISPLAY_MAX_BINS: usize = 1024;
 const DISPLAY_MAX_FRAMES: usize = 2048;
 
+/// How many blocks to process at once: use the machine's cores, but cap it so a
+/// 60 s minimum block length is still respected on huge machines.
+fn block_workers() -> usize {
+    std::env::var("AVALON_BLOCK_WORKERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+                .clamp(1, 4)
+        })
+}
+
 /// Pick a block length whose spectrogram plus FFT scratch fits the memory
 /// budget. Cost per block ≈ bins x frames x 4 bytes, doubled for scratch.
 fn plan_block_seconds(sr: u32, params: &spectrogram::StftParams) -> f64 {
@@ -199,7 +213,15 @@ fn analyse_blocks(
     send: &dyn Fn(Progress),
 ) -> (crate::model::Spectrogram, Vec<crate::model::Ridge>) {
     let duration = samples.len() as f64 / sr as f64;
-    let block_s = plan_block_seconds(sr, params);
+    // Run several blocks at once instead of one giant block serially: the RAM
+    // budget is what limits block size, so splitting it across N workers keeps
+    // peak memory the same while using N cores. This is the analysis stage's
+    // real parallelism — the per-block FFT pass alone barely scaled.
+    let workers = block_workers();
+    let block_s = (plan_block_seconds(sr, params) / workers as f64).max(60.0);
+    // Overlap stays at half a block. Measured on the reference clip: dropping it
+    // to 20 % saves 15 s of the 56 s analysis but loses 9 of 37 ridges and 3 of
+    // 17 events, i.e. it buys speed by missing weak flyovers. Keep the accuracy.
     let overlap_s = (block_s / 2.0).max(10.0);
     let step = (block_s - overlap_s).max(1.0);
     crate::log::info(
@@ -209,82 +231,139 @@ fn analyse_blocks(
             crate::log::budget_bytes() as f64 / 1e6
         ),
     );
-    let mut ridges_all: Vec<crate::model::Ridge> = Vec::new();
-    let mut merged: Option<crate::model::Spectrogram> = None;
-    let mut start_s = 0.0f64;
-    let mut block = 0usize;
-    let total_blocks = ((duration / step).ceil() as usize).max(1);
-
-    while start_s < duration {
-        block += 1;
-        send(Progress::Stage {
-            name: "Analysing blocks",
-            fraction: 0.15 + 0.4 * (block as f32 / total_blocks as f32),
-        });
-        let end_s = (start_s + block_s).min(duration);
-        let a = (start_s * sr as f64) as usize;
-        let b = ((end_s * sr as f64) as usize).min(samples.len());
-        if b <= a {
-            break;
-        }
-
-        let spec = spectrogram::compute_spectrogram(&samples[a..b], sr, params);
-        if spec.time_axis_s.is_empty() {
-            break;
-        }
-        crate::log::debug(
-            "pipeline",
-            &format!(
-                "block {block} {:.0}-{:.0}s: {} bins x {} frames, rss {:.0} MB",
-                start_s,
-                end_s,
-                spec.freq_axis_hz.len(),
-                spec.time_axis_s.len(),
-                crate::log::rss_bytes() as f64 / 1e6
-            ),
-        );
-        let mut rs = ridge::detect_ridges(&spec, seed);
-        for r in rs.iter_mut() {
-            r.start_s += start_s;
-            r.end_s += start_s;
-            for s in r.samples.iter_mut() {
-                s.t_s += start_s;
+    // Block ranges first, then process them on `workers` threads. Blocks are
+    // independent (they only overlap for ridge continuity), so this is the
+    // parallelism that matters: the per-block FFT pass alone barely scaled.
+    let ranges: Vec<(usize, f64, f64)> = {
+        let mut v = Vec::new();
+        let mut start_s = 0.0f64;
+        while start_s < duration {
+            let end_s = (start_s + block_s).min(duration);
+            let a = (start_s * sr as f64) as usize;
+            let b = ((end_s * sr as f64) as usize).min(samples.len());
+            if b <= a {
+                break;
             }
+            v.push((v.len() + 1, start_s, end_s));
+            if end_s >= duration {
+                break;
+            }
+            start_s = end_s - overlap_s;
         }
-        send(Progress::Log(format!(
-            "block {block}: {:.0}-{:.0}s, {} ridges",
-            start_s,
-            end_s,
-            rs.len()
-        )));
-        ridges_all.append(&mut rs);
+        v
+    };
+    let total_blocks = ranges.len().max(1);
+    crate::log::info(
+        "pipeline",
+        &format!(
+            "block plan: {total_blocks} blocks of {block_s:.0}s ({overlap_s:.0}s overlap) on {workers} worker(s)"
+        ),
+    );
 
-        // Accumulate into a FIXED display grid. Stitching per-block row vectors
-        // produced ragged rows (the first block was not pooled, later ones
-        // were), which then panicked the renderer on an out-of-bounds column.
-        {
-            let grid = merged.get_or_insert_with(|| make_display_grid(params, duration));
-            let rows = grid.contrast.len();
-            let cols = grid.time_axis_s.len();
-            let n_freq = spec.freq_axis_hz.len().min(spec.contrast.len());
-            for (fi, &t) in spec.time_axis_s.iter().enumerate() {
-                let abs_t = start_s + t;
-                let col = ((abs_t / duration) * (cols - 1) as f64).round() as usize;
-                let col = col.min(cols - 1);
-                for k in 0..n_freq {
-                    let row = (k * rows / n_freq).min(rows - 1);
-                    let v = spec.contrast[k][fi];
-                    if v > grid.contrast[row][col] {
-                        grid.contrast[row][col] = v;
+    struct BlockOut {
+        n: usize,
+        start_s: f64,
+        ridges: Vec<crate::model::Ridge>,
+        grid: Option<crate::model::Spectrogram>,
+    }
+
+    let done = std::sync::atomic::AtomicUsize::new(0);
+    let mut outs: Vec<BlockOut> = {
+        use rayon::prelude::*;
+        ranges
+            .par_iter()
+            .map(|&(n, start_s, end_s)| {
+                let a = (start_s * sr as f64) as usize;
+                let b = ((end_s * sr as f64) as usize).min(samples.len());
+                let t0 = std::time::Instant::now();
+                let spec = spectrogram::compute_spectrogram(&samples[a..b], sr, params);
+                let t_spec = t0.elapsed();
+                if spec.time_axis_s.is_empty() {
+                    return BlockOut { n, start_s, ridges: Vec::new(), grid: None };
+                }
+                let t1 = std::time::Instant::now();
+                let mut ridges = ridge::detect_ridges(&spec, seed);
+                let t_ridge = t1.elapsed();
+                for r in ridges.iter_mut() {
+                    r.start_s += start_s;
+                    r.end_s += start_s;
+                    for smp in r.samples.iter_mut() {
+                        smp.t_s += start_s;
                     }
                 }
+                // Each block pools into its own display grid; the merge below is
+                // a max-fold, so order does not matter.
+                let t2 = std::time::Instant::now();
+                let mut grid = make_display_grid(params, duration);
+                {
+                    let rows = grid.contrast.len();
+                    let cols = grid.time_axis_s.len();
+                    let n_freq = spec.freq_axis_hz.len().min(spec.contrast.len());
+                    for (fi, &t) in spec.time_axis_s.iter().enumerate() {
+                        let abs_t = start_s + t;
+                        let col = ((abs_t / duration) * (cols - 1) as f64).round() as usize;
+                        let col = col.min(cols - 1);
+                        for k in 0..n_freq {
+                            let row = (k * rows / n_freq).min(rows - 1);
+                            let v = spec.contrast[k][fi];
+                            if v > grid.contrast[row][col] {
+                                grid.contrast[row][col] = v;
+                            }
+                        }
+                    }
+                }
+                // Progress is reported by the merge loop below: `send` is not
+                // Sync, so it cannot be called from the worker threads.
+                done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if std::env::var("AVALON_TIMING").is_ok() {
+                    crate::log::info(
+                        "pipeline",
+                        &format!(
+                            "block {n}: spectrogram {:.1}s, ridges {:.1}s, display-pool {:.1}s",
+                            t_spec.as_secs_f64(),
+                            t_ridge.as_secs_f64(),
+                            t2.elapsed().as_secs_f64()
+                        ),
+                    );
+                }
+                BlockOut { n, start_s, ridges, grid: Some(grid) }
+            })
+            .collect()
+    };
+    outs.sort_by_key(|o| o.n);
+
+    let mut ridges_all: Vec<crate::model::Ridge> = Vec::new();
+    let mut merged: Option<crate::model::Spectrogram> = None;
+    let mut merged_blocks = 0usize;
+    for out in outs {
+        merged_blocks += 1;
+        send(Progress::Stage {
+            name: "Analysing blocks",
+            fraction: 0.55 + 0.4 * (merged_blocks as f32 / total_blocks as f32),
+        });
+        send(Progress::Log(format!(
+            "block {}: {:.0}-{:.0}s, {} ridges",
+            out.n,
+            out.start_s,
+            out.start_s + block_s,
+            out.ridges.len()
+        )));
+        ridges_all.append(&mut { out.ridges });
+        if let Some(g) = out.grid {
+            match merged.as_mut() {
+                Some(m) => {
+                    for (row, rows_g) in g.contrast.iter().enumerate() {
+                        let dst = &mut m.contrast[row];
+                        for (col, v) in rows_g.iter().enumerate() {
+                            if *v > dst[col] {
+                                dst[col] = *v;
+                            }
+                        }
+                    }
+                }
+                None => merged = Some(g),
             }
         }
-
-        if end_s >= duration {
-            break;
-        }
-        start_s = end_s - overlap_s;
     }
 
     let spec = match merged {

@@ -47,12 +47,14 @@ fn main() -> anyhow::Result<()> {
     let mut time: Option<(i64, i64)> = None;
     let mut truth = TRUTH;
     let mut jsonl: Option<PathBuf> = None;
+    let mut provider = "staging-0".to_string();
     let mut regions: Vec<(String, Bounds)> = Vec::new();
     while let Some(a) = args.next() {
         match a.as_str() {
             "--clip" => clip = PathBuf::from(args.next().unwrap_or_default()),
             "--analysis" => cache = Some(PathBuf::from(args.next().unwrap_or_default())),
             "--jsonl" => jsonl = Some(PathBuf::from(args.next().unwrap_or_default())),
+            "--provider" => provider = args.next().unwrap_or_default(),
             "--time" => {
                 let s = args.next().unwrap_or_default();
                 let (a, b) = s.split_once(':').unwrap_or((&s, &s));
@@ -167,7 +169,7 @@ fn main() -> anyhow::Result<()> {
         };
         let mut log = |m: String| println!("  {m}");
         let t = Instant::now();
-        let res = search::run_search(&req, &events, &ridges, "staging-0", &mut prog, &mut log, &cancel);
+        let res = search::run_search(&req, &events, &ridges, &provider, &mut prog, &mut log, &cancel);
         let elapsed = t.elapsed().as_secs_f64();
         match res {
             Ok(r) => {

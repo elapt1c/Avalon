@@ -8,6 +8,10 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1600.0, 1000.0])
             .with_min_inner_size([1000.0, 640.0])
+            // Start maximised: a fixed 1600x1000 window is larger than a laptop
+            // panel, and the WM then places it partly off-screen, which is what
+            // crops the source column on smaller displays.
+            .with_maximized(true)
             .with_title("AVALON — Acoustic Signal Geolocation"),
         ..Default::default()
     };

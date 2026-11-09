@@ -76,53 +76,59 @@ pub fn detect_ridges(spec: &Spectrogram, seed_contrast: f32) -> Vec<Ridge> {
     let min_sep_hz = 0.75 * spec.resolution_hz.max(bin_hz);
     let local_window = ((min_sep_hz / bin_hz / 2.0).round() as usize).clamp(1, 64);
 
-    let mut peaks: Vec<Vec<Peak>> = (0..n_frames).map(|_| Vec::new()).collect();
-    let mut candidates: Vec<Peak> = Vec::new();
-    for t in 0..n_frames {
-        candidates.clear();
-        for k in 0..n_freq {
-            let c = spec.contrast[k][t];
-            if c < seed {
-                continue;
-            }
-            let mut is_max = true;
-            for d in 1..=local_window {
-                if k >= d && spec.contrast[k - d][t] > c {
-                    is_max = false;
-                    break;
+    // Every frame is independent here (read-only contrast column, per-frame peak
+    // list), so this is the analysis hot loop and it runs on the whole pool.
+    use rayon::prelude::*;
+    let peaks: Vec<Vec<Peak>> = (0..n_frames)
+        .into_par_iter()
+        .map(|t| {
+            let mut out: Vec<Peak> = Vec::new();
+            let mut candidates: Vec<Peak> = Vec::new();
+            for k in 0..n_freq {
+                let c = spec.contrast[k][t];
+                if c < seed {
+                    continue;
                 }
-                if k + d < n_freq && spec.contrast[k + d][t] > c {
-                    is_max = false;
-                    break;
+                let mut is_max = true;
+                for d in 1..=local_window {
+                    if k >= d && spec.contrast[k - d][t] > c {
+                        is_max = false;
+                        break;
+                    }
+                    if k + d < n_freq && spec.contrast[k + d][t] > c {
+                        is_max = false;
+                        break;
+                    }
+                }
+                if is_max {
+                    candidates.push(Peak {
+                        freq_hz: spec.freq_axis_hz[k],
+                        contrast: c,
+                    });
                 }
             }
-            if is_max {
-                candidates.push(Peak {
-                    freq_hz: spec.freq_axis_hz[k],
-                    contrast: c,
-                });
+            // Greedy NMS: strongest first, drop anything within `min_sep_hz`.
+            candidates.sort_by(|a, b| {
+                b.contrast
+                    .partial_cmp(&a.contrast)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            for cand in candidates.drain(..) {
+                if out
+                    .iter()
+                    .all(|p| (p.freq_hz - cand.freq_hz).abs() >= min_sep_hz)
+                {
+                    out.push(cand);
+                }
             }
-        }
-        // Greedy NMS: strongest first, drop anything within `min_sep_hz`.
-        candidates.sort_by(|a, b| {
-            b.contrast
-                .partial_cmp(&a.contrast)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        for cand in candidates.drain(..) {
-            if peaks[t]
-                .iter()
-                .all(|p| (p.freq_hz - cand.freq_hz).abs() >= min_sep_hz)
-            {
-                peaks[t].push(cand);
-            }
-        }
-        peaks[t].sort_by(|a, b| {
-            a.freq_hz
-                .partial_cmp(&b.freq_hz)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-    }
+            out.sort_by(|a, b| {
+                a.freq_hz
+                    .partial_cmp(&b.freq_hz)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            out
+        })
+        .collect();
 
     let hop_s = if n_frames > 1 {
         spec.time_axis_s[1] - spec.time_axis_s[0]

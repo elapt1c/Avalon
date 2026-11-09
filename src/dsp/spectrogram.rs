@@ -50,24 +50,59 @@ pub fn compute_spectrogram(samples: &[f32], sample_rate: u32, params: &StftParam
     let n_freq = max_bin - min_bin + 1;
 
     let mut mag: Vec<Vec<f32>> = vec![vec![0.0f32; n_frames]; n_freq];
+    let t_all = std::time::Instant::now();
+    if std::env::var("AVALON_TIMING").is_ok() {
+        crate::log::info(
+            "spec",
+            &format!("frames {n_frames} x bins {n_freq} (fft {fft_size}, win {win_len}, hop {hop_len})"),
+        );
+    }
 
-    let mut planner = FftPlanner::<f32>::new();
-    let fft = planner.plan_fft_forward(fft_size);
-    let mut buf = vec![Complex::new(0.0f32, 0.0f32); fft_size];
-
-    for f in 0..n_frames {
-        let start = f * hop_len;
-        buf.fill(Complex::new(0.0, 0.0));
-        for (i, w) in window.iter().enumerate() {
-            buf[i] = Complex::new(samples[start + i] * w, 0.0);
-        }
-        fft.process(&mut buf);
-        for k in min_bin..=max_bin {
-            // Magnitude (scale cancels in the contrast ratio).
-            mag[k - min_bin][f] = buf[k].norm();
+    // Frames are independent, so the FFT pass runs on the whole pool. Output is
+    // collected frame-major (cache-friendly for the workers) and scattered into
+    // the freq-major matrix afterwards; one memcpy pass costs a second, the FFT
+    // pass used to cost the entire analysis.
+    {
+        use rayon::prelude::*;
+        const CHUNK_FRAMES: usize = 256;
+        let mut chunk_buf = vec![0.0f32; CHUNK_FRAMES.min(n_frames.max(1)) * n_freq];
+        for c0 in (0..n_frames).step_by(CHUNK_FRAMES) {
+            let c1 = (c0 + CHUNK_FRAMES).min(n_frames);
+            let cf = c1 - c0;
+            let buf = &mut chunk_buf[..cf * n_freq];
+            buf.par_chunks_mut(n_freq).enumerate().for_each_init(
+                || {
+                    let mut planner = FftPlanner::<f32>::new();
+                    (
+                        planner.plan_fft_forward(fft_size),
+                        vec![Complex::new(0.0f32, 0.0f32); fft_size],
+                    )
+                },
+                |(fft, scratch), (i, out)| {
+                    let f = c0 + i;
+                    let start = f * hop_len;
+                    scratch.fill(Complex::new(0.0, 0.0));
+                    for (j, w) in window.iter().enumerate() {
+                        scratch[j] = Complex::new(samples[start + j] * w, 0.0);
+                    }
+                    fft.process(scratch);
+                    for k in min_bin..=max_bin {
+                        out[k - min_bin] = scratch[k].norm();
+                    }
+                },
+            );
+            for i in 0..cf {
+                let f = c0 + i;
+                let row = &buf[i * n_freq..(i + 1) * n_freq];
+                for (k, v) in row.iter().enumerate() {
+                    mag[k][f] = *v;
+                }
+            }
         }
     }
 
+    let t_fft = t_all.elapsed();
+    let t_gate = std::time::Instant::now();
     // Per-frame peak magnitude, used as a dynamic-range gate: a zero-padded FFT
     // of a clean tone shows Hann sidelobes across the whole band that would
     // otherwise read as dozens of separate tonals.
@@ -83,15 +118,25 @@ pub fn compute_spectrogram(samples: &[f32], sample_rate: u32, params: &StftParam
     // Per-frequency-bin median baseline, then contrast = mag / (median + eps),
     // gated to 26 dB below that frame's strongest component. Written back into
     // `mag` in place: a one-hour clip at full band is ~0.5 GB per matrix.
-    for k in 0..n_freq {
-        let baseline = crate::dsp::median_f32(&mag[k]).max(1e-6);
-        for f in 0..n_frames {
-            mag[k][f] = if mag[k][f] < 0.05 * frame_max[f] {
-                0.0
-            } else {
-                mag[k][f] / baseline
-            };
-        }
+    {
+        use rayon::prelude::*;
+        mag.par_iter_mut().for_each(|row| {
+            let baseline = crate::dsp::median_f32(row).max(1e-6);
+            for (f, v) in row.iter_mut().enumerate() {
+                *v = if *v < 0.05 * frame_max[f] { 0.0 } else { *v / baseline };
+            }
+        });
+    }
+    if std::env::var("AVALON_TIMING").is_ok() {
+        crate::log::info(
+            "spec",
+            &format!(
+                "fft+scatter {:.1}s, gate+contrast {:.1}s, total {:.1}s",
+                t_fft.as_secs_f64(),
+                t_gate.elapsed().as_secs_f64(),
+                t_all.elapsed().as_secs_f64()
+            ),
+        );
     }
     let contrast = mag;
 
