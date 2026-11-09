@@ -1454,7 +1454,14 @@ impl App {
             .stick_to_bottom(true)
             .show(ui, |ui| {
                 for line in &self.search_log {
-                    ui.label(RichText::new(line).color(theme::MUTED).monospace().small());
+                    // Truncate, never spill: a long flight-pair or path string
+                    // used to paint straight over the neighbouring widgets.
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(line).color(theme::MUTED).monospace().small(),
+                        )
+                        .truncate(),
+                    );
                 }
             });
     }

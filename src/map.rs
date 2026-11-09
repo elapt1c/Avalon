@@ -15,6 +15,9 @@ const MAX_IN_FLIGHT: usize = 24;
 const MAX_CACHE: usize = 1024;
 /// Number of tiles at a given zoom (longitude axis).
 const TILE: f64 = 256.0;
+/// Scroll pixels per zoom level. One wheel notch delivers ~80 px through
+/// egui's smoothed delta (measured), so this is "one notch = one level".
+const NOTCH_PX: f64 = 80.0;
 /// Heatmap raster is downsampled to at most this many texels per side.
 const HEAT_MAX_TEXELS: usize = 1024;
 
@@ -37,9 +40,11 @@ struct Heat {
 }
 
 pub struct MapState {
-    // Center in world-pixel coordinates at the current zoom.
-    center_px: f64,
-    center_py: f64,
+    // Centre in normalised Web-Mercator coords (0..1). Storing pixels meant
+    // every zoom step had to rescale the centre, and a single bad step threw
+    // the view thousands of km off.
+    cx: f64,
+    cy: f64,
     zoom: f32,
     pub mode: Mode,
     tile_cache: HashMap<TileKey, TextureHandle>,
@@ -54,6 +59,7 @@ pub struct MapState {
     /// Optional ground-truth point drawn as a crosshair (accuracy check).
     marker: Option<(f64, f64)>,
     // interaction
+    zoom_accum: f64,
     last_pointer: Option<Pos2>,
     draw_start: Option<Pos2>,
     draw_end: Option<Pos2>,
@@ -61,7 +67,6 @@ pub struct MapState {
 
 impl MapState {
     pub fn new(lat: f64, lon: f64, zoom: f32) -> Self {
-        let scale = TILE * 2f64.powi(zoom as i32);
         let (req_tx, req_rx) = channel::<TileKey>();
         let (res_tx, res_rx) = channel::<TileResult>();
         // One loader thread per map; it lives as long as the app does.
@@ -83,8 +88,8 @@ impl MapState {
             })
             .ok();
         Self {
-            center_px: lon_to_world_x(lon) * scale,
-            center_py: lat_to_world_y(lat) * scale,
+            cx: lon_to_world_x(lon),
+            cy: lat_to_world_y(lat),
             zoom,
             mode: Mode::Pan,
             tile_cache: HashMap::new(),
@@ -95,10 +100,16 @@ impl MapState {
             rectangles: Vec::new(),
             heat: None,
             marker: None,
+            zoom_accum: 0.0,
             last_pointer: None,
             draw_start: None,
             draw_end: None,
         }
+    }
+
+    /// Screen pixels per unit of normalised world space.
+    fn scale(&self) -> f64 {
+        TILE * 2f64.powf(self.zoom as f64)
     }
 
     pub fn rectangles(&self) -> &[Bounds] {
@@ -266,6 +277,11 @@ impl MapState {
         self.marker = p;
     }
 
+    /// Current (fractional) zoom level, for the header readout.
+    pub fn zoom(&self) -> f32 {
+        self.zoom
+    }
+
     /// True while tile requests are still outstanding (drives the busy strip).
     pub fn tiles_pending(&self) -> bool {
         !self.pending.is_empty()
@@ -330,9 +346,28 @@ impl MapState {
         let painter = ui.painter_at(rect);
 
         // Zoom via scroll.
-        let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-        if resp.hovered() && scroll != 0.0 {
-            self.zoom_at_rect(resp.hover_pos().unwrap_or(rect.center()), rect, scroll > 0.0);
+        // raw_scroll_delta, not smooth: the smoothed value is re-delivered over
+        // several frames, so one wheel notch used to zoom three or four levels.
+        // Use the raw wheel delta when it is non-zero (one notch = one step) and
+        // fall back to the smoothed value otherwise; the smoothed value alone is
+        // re-delivered over several frames, so a single notch zoomed 3-4 levels.
+        // Accumulate the smoothed scroll and spend it in fixed 40 px chunks.
+        // Applying the smoothed delta directly zoomed once per frame while it
+        // decayed, so a single wheel notch jumped three or four levels.
+        let scroll = ui.input(|i| i.smooth_scroll_delta.y) as f64;
+        let cursor = resp.hover_pos().unwrap_or(rect.center());
+        if resp.hovered() {
+            self.zoom_accum += scroll;
+            while self.zoom_accum >= NOTCH_PX {
+                self.zoom_accum -= NOTCH_PX;
+                self.zoom_at_rect(cursor, rect, 1.0);
+            }
+            while self.zoom_accum <= -NOTCH_PX {
+                self.zoom_accum += NOTCH_PX;
+                self.zoom_at_rect(cursor, rect, -1.0);
+            }
+        } else {
+            self.zoom_accum = 0.0;
         }
 
         // Pan / draw interaction.
@@ -345,21 +380,23 @@ impl MapState {
         self.draw_overlays(&painter, rect);
     }
 
-    fn zoom_at_rect(&mut self, cursor: Pos2, rect: Rect, zoom_in: bool) {
+    fn zoom_at_rect(&mut self, cursor: Pos2, rect: Rect, dz: f32) {
         let c = rect.center();
         let dx = (cursor.x - c.x) as f64;
         let dy = (cursor.y - c.y) as f64;
-        let cwx = self.center_px + dx;
-        let cwy = self.center_py + dy;
-        let new_zoom = if zoom_in {
-            (self.zoom + 1.0).min(18.0)
-        } else {
-            (self.zoom - 1.0).max(2.0)
-        };
-        let f = 2f64.powi(new_zoom as i32 - self.zoom as i32);
-        self.center_px = cwx * f - dx;
-        self.center_py = cwy * f - dy;
+        let new_zoom = (self.zoom + dz).clamp(2.0, 18.0);
+        if (new_zoom - self.zoom).abs() < f32::EPSILON {
+            return;
+        }
+        // Keep the world point under the cursor pinned there: solve for the
+        // centre that puts it back at the same screen position.
+        let s_old = self.scale();
+        let wx = self.cx + dx / s_old;
+        let wy = self.cy + dy / s_old;
         self.zoom = new_zoom;
+        let s_new = self.scale();
+        self.cx = wx - dx / s_new;
+        self.cy = wy - dy / s_new;
     }
 
     fn handle_pointer(&mut self, resp: egui::Response, rect: Rect, ctx: &egui::Context) {
@@ -377,8 +414,9 @@ impl MapState {
                 if resp.dragged_by(egui::PointerButton::Primary) {
                     if let (Some(p), Some(last)) = (pos, self.last_pointer) {
                         let d = p - last;
-                        self.center_px -= d.x as f64;
-                        self.center_py -= d.y as f64;
+                        let s = self.scale();
+                        self.cx -= d.x as f64 / s;
+                        self.cy -= d.y as f64 / s;
                     }
                     self.last_pointer = pos;
                 } else {
@@ -408,7 +446,7 @@ impl MapState {
 
     fn screen_rect_to_bounds(&self, r: Rect, map_rect: Rect) -> Option<Bounds> {
         let c = map_rect.center();
-        let scale = TILE * 2f64.powi(self.zoom as i32);
+        let scale = self.scale();
         let corners = [
             Pos2::new(r.min.x, r.min.y),
             Pos2::new(r.max.x, r.min.y),
@@ -420,10 +458,10 @@ impl MapState {
         let mut east = f64::NEG_INFINITY;
         let mut north = f64::NEG_INFINITY;
         for p in corners {
-            let wx = self.center_px + (p.x - c.x) as f64;
-            let wy = self.center_py + (p.y - c.y) as f64;
-            let lon = world_x_to_lon(wx / scale);
-            let lat = world_y_to_lat(wy / scale);
+            let wx = self.cx + (p.x - c.x) as f64 / scale;
+            let wy = self.cy + (p.y - c.y) as f64 / scale;
+            let lon = world_x_to_lon(wx);
+            let lat = world_y_to_lat(wy);
             west = west.min(lon);
             east = east.max(lon);
             south = south.min(lat);
@@ -438,33 +476,35 @@ impl MapState {
     }
 
     fn draw_tiles(&mut self, painter: &egui::Painter, rect: Rect) {
-        let z = self.zoom.floor() as i32;
-        let z = z.clamp(0, 19) as u32;
-        let max_tile = (1i64 << z) as i64;
+        // Tile level is floored; the fractional part scales the whole layer, so
+        // zooming is continuous instead of snapping a whole level at a time.
+        let level = self.zoom.floor().clamp(0.0, 19.0) as u32;
+        let f = 2f64.powf(self.zoom as f64 - level as f64); // 1.0 .. 2.0
+        let tile_px = TILE * f;
+        let max_tile = (1i64 << level) as i64;
+
+        // World-space window of the viewport, in tile units at this level.
+        let s = self.scale();
         let c = rect.center();
+        let wx0 = self.cx - (rect.width() as f64 / 2.0) / s;
+        let wx1 = self.cx + (rect.width() as f64 / 2.0) / s;
+        let wy0 = self.cy - (rect.height() as f64 / 2.0) / s;
+        let wy1 = self.cy + (rect.height() as f64 / 2.0) / s;
+        let tx0 = (wx0 * max_tile as f64).floor() as i64;
+        let tx1 = (wx1 * max_tile as f64).floor() as i64;
+        let ty0 = (wy0 * max_tile as f64).floor() as i64;
+        let ty1 = (wy1 * max_tile as f64).floor() as i64;
 
-        // Anchor for prioritising requests: centre of the viewport.
-        let acx = self.center_px / TILE;
-        let acy = self.center_py / TILE;
-
-        let wpx0 = self.center_px - rect.width() as f64 / 2.0;
-        let wpx1 = self.center_px + rect.width() as f64 / 2.0;
-        let wpy0 = self.center_py - rect.height() as f64 / 2.0;
-        let wpy1 = self.center_py + rect.height() as f64 / 2.0;
-
-        let tx0 = (wpx0 / TILE).floor() as i64;
-        let tx1 = (wpx1 / TILE).floor() as i64;
-        let ty0 = (wpy0 / TILE).floor() as i64;
-        let ty1 = (wpy1 / TILE).floor() as i64;
-
-        // Collect what is missing, then queue the nearest ones first.
+        // Queue what is missing, nearest to the centre first.
+        let acx = self.cx * max_tile as f64;
+        let acy = self.cy * max_tile as f64;
         let mut missing: Vec<(i64, i64, f64)> = Vec::new();
         for ty in ty0..=ty1 {
             for tx in tx0..=tx1 {
                 if tx < 0 || tx >= max_tile || ty < 0 || ty >= max_tile {
                     continue;
                 }
-                let key = (z, tx as u32, ty as u32);
+                let key = (level, tx as u32, ty as u32);
                 if self.tile_cache.contains_key(&key)
                     || self.pending.contains(&key)
                     || self.failed.contains(&key)
@@ -480,7 +520,7 @@ impl MapState {
             if self.pending.len() >= MAX_IN_FLIGHT {
                 break;
             }
-            let key = (z, tx as u32, ty as u32);
+            let key = (level, tx as u32, ty as u32);
             if self.tile_tx.send(key).is_ok() {
                 self.pending.insert(key);
             }
@@ -491,44 +531,60 @@ impl MapState {
                 if tx < 0 || tx >= max_tile || ty < 0 || ty >= max_tile {
                     continue;
                 }
-                let key = (z, tx as u32, ty as u32);
-                let left = tx as f64 * TILE - self.center_px + c.x as f64;
-                let right = (tx as f64 + 1.0) * TILE - self.center_px + c.x as f64;
-                let top = ty as f64 * TILE - self.center_py + c.y as f64;
-                let bottom = (ty as f64 + 1.0) * TILE - self.center_py + c.y as f64;
-                let screen = Rect::from_min_max(
+                let key = (level, tx as u32, ty as u32);
+                let left = (tx as f64 / max_tile as f64 - self.cx) * s + c.x as f64;
+                let top = (ty as f64 / max_tile as f64 - self.cy) * s + c.y as f64;
+                let screen = Rect::from_min_size(
                     Pos2::new(left as f32, top as f32),
-                    Pos2::new(right as f32, bottom as f32),
+                    egui::vec2(tile_px as f32, tile_px as f32),
                 );
-                match self.tile_cache.get(&key) {
-                    Some(tex) => {
-                        let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
-                        painter.image(tex.id(), screen, uv, Color32::WHITE);
-                    }
-                    None if self.failed.contains(&key) => {
-                        // Permanently unavailable: leave the panel background.
-                        painter.rect_filled(
-                            screen,
-                            0.0,
-                            crate::theme::BG.gamma_multiply(1.4),
-                        );
-                    }
-                    None => {
-                        // In flight: a neutral placeholder keeps the layout stable
-                        // instead of flashing holes while tiles arrive.
-                        painter.rect_filled(
-                            screen,
-                            0.0,
-                            crate::theme::PANEL.gamma_multiply(0.8),
-                        );
-                    }
+                let uv_full = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
+
+                if let Some(tex) = self.tile_cache.get(&key) {
+                    painter.image(tex.id(), screen, uv_full, Color32::WHITE);
+                    continue;
+                }
+                // Not loaded yet: draw the best ancestor we already hold, scaled
+                // into this tile's slot. Coarse-but-instant beats a black hole
+                // that fills in chunk by chunk.
+                if let Some((atex, uv)) = self.ancestor(level, tx as u32, ty as u32) {
+                    painter.image(atex, screen, uv, Color32::WHITE);
+                    continue;
+                }
+                if !self.failed.contains(&key) {
+                    painter.rect_filled(screen, 0.0, crate::theme::PANEL.gamma_multiply(0.8));
+                } else {
+                    painter.rect_filled(screen, 0.0, crate::theme::BG.gamma_multiply(1.4));
                 }
             }
         }
-        // Keep animating while requests are outstanding.
         if !self.pending.is_empty() {
             painter.ctx().request_repaint_after(std::time::Duration::from_millis(120));
         }
+    }
+
+    /// A cached lower-resolution ancestor for this tile, plus the sub-rectangle
+    /// of it that this tile occupies.
+    fn ancestor(&self, level: u32, tx: u32, ty: u32) -> Option<(egui::TextureId, Rect)> {
+        for up in 1..=6u32 {
+            if level < up {
+                break;
+            }
+            let az = level - up;
+            let ax = tx >> up;
+            let ay = ty >> up;
+            if let Some(tex) = self.tile_cache.get(&(az, ax, ay)) {
+                let div = (1u32 << up) as f32;
+                let fx = (tx - (ax << up)) as f32 / div;
+                let fy = (ty - (ay << up)) as f32 / div;
+                let uv = Rect::from_min_max(
+                    Pos2::new(fx, fy),
+                    Pos2::new(fx + 1.0 / div, fy + 1.0 / div),
+                );
+                return Some((tex.id(), uv));
+            }
+        }
+        None
     }
 
     fn draw_overlays(&self, painter: &egui::Painter, rect: Rect) {
@@ -545,6 +601,14 @@ impl MapState {
             let r = Rect::from_two_pos(a, b);
             painter.rect_stroke(r, 0.0, stroke, egui::StrokeKind::Middle);
         }
+        // Zoom readout, bottom-left: the header row can be crowded out.
+        painter.text(
+            Pos2::new(rect.max.x - 10.0, rect.min.y + 24.0),
+            egui::Align2::RIGHT_TOP,
+            format!("Z {:.1}", self.zoom),
+            egui::FontId::monospace(11.0),
+            Color32::from_white_alpha(200),
+        );
         // Ground truth crosshair.
         if let Some((lat, lon)) = self.marker {
             if let Some(p) = self.latlon_screen(lat, lon, rect) {
@@ -565,9 +629,9 @@ impl MapState {
 
     fn latlon_screen(&self, lat: f64, lon: f64, map_rect: Rect) -> Option<Pos2> {
         let c = map_rect.center();
-        let scale = TILE * 2f64.powi(self.zoom as i32);
-        let x = lon_to_world_x(lon) * scale - self.center_px + c.x as f64;
-        let y = lat_to_world_y(lat) * scale - self.center_py + c.y as f64;
+        let scale = self.scale();
+        let x = (lon_to_world_x(lon) - self.cx) * scale + c.x as f64;
+        let y = (lat_to_world_y(lat) - self.cy) * scale + c.y as f64;
         Some(Pos2::new(x as f32, y as f32))
     }
 
@@ -613,11 +677,11 @@ impl MapState {
 
     fn bounds_to_screen_rect(&self, b: Bounds, map_rect: Rect) -> Option<Rect> {
         let c = map_rect.center();
-        let scale = TILE * 2f64.powi(self.zoom as i32);
-        let x0 = lon_to_world_x(b.west) * scale - self.center_px + c.x as f64;
-        let x1 = lon_to_world_x(b.east) * scale - self.center_px + c.x as f64;
-        let y0 = lat_to_world_y(b.north) * scale - self.center_py + c.y as f64;
-        let y1 = lat_to_world_y(b.south) * scale - self.center_py + c.y as f64;
+        let scale = self.scale();
+        let x0 = (lon_to_world_x(b.west) - self.cx) * scale + c.x as f64;
+        let x1 = (lon_to_world_x(b.east) - self.cx) * scale + c.x as f64;
+        let y0 = (lat_to_world_y(b.north) - self.cy) * scale + c.y as f64;
+        let y1 = (lat_to_world_y(b.south) - self.cy) * scale + c.y as f64;
         Some(Rect::from_min_max(
             Pos2::new(x0 as f32, y0 as f32),
             Pos2::new(x1 as f32, y1 as f32),
