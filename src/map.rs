@@ -58,6 +58,14 @@ pub struct MapState {
     heat: Option<Heat>,
     /// Optional ground-truth point drawn as a crosshair (accuracy check).
     marker: Option<(f64, f64)>,
+    /// Animated camera target: (cx, cy, zoom) and the interpolation state.
+    cam_from: Option<(f64, f64, f32)>,
+    cam_to: Option<(f64, f64, f32)>,
+    cam_t: f32,
+    /// Live peaks (lat, lon, score) drawn as HUD markers while solving.
+    pub peaks: Vec<([f32; 3])>,
+    /// Final answer, highlighted when the run finishes.
+    pub winner: Option<(f64, f64)>,
     // interaction
     zoom_accum: f64,
     last_pointer: Option<Pos2>,
@@ -100,6 +108,11 @@ impl MapState {
             rectangles: Vec::new(),
             heat: None,
             marker: None,
+            cam_from: None,
+            cam_to: None,
+            cam_t: 1.0,
+            peaks: Vec::new(),
+            winner: None,
             zoom_accum: 0.0,
             last_pointer: None,
             draw_start: None,
@@ -286,6 +299,40 @@ impl MapState {
         self.zoom
     }
 
+    /// Smoothly fly to a region: centre and zoom are eased over ~0.9 s.
+    pub fn fly_to_bounds(&mut self, b: Bounds) {
+        if !b.valid() {
+            return;
+        }
+        let (lat, lon) = b.center();
+        let span = (b.north - b.south).abs().max((b.east - b.west).abs()).max(1e-4);
+        // Fit the span into a 900 px viewport, with a little margin.
+        let zoom = (360.0f64 / span / 3.2).log2().clamp(2.0, 17.0) as f32;
+        self.cam_from = Some((self.cx, self.cy, self.zoom));
+        self.cam_to = Some((lon_to_world_x(lon), lat_to_world_y(lat), zoom));
+        self.cam_t = 0.0;
+    }
+
+    /// Step the camera animation. Called once per frame from `show`.
+    fn step_camera(&mut self, ctx: &egui::Context) {
+        let Some((tx, ty, tz)) = self.cam_to else { return };
+        let (fx, fy, fz) = self
+            .cam_from
+            .unwrap_or((self.cx, self.cy, self.zoom));
+        let dt = ctx.input(|i| i.stable_dt).clamp(0.001, 0.1);
+        self.cam_t = (self.cam_t + dt / 0.9).min(1.0);
+        // Smoothstep: no jerk at either end.
+        let e = self.cam_t * self.cam_t * (3.0 - 2.0 * self.cam_t);
+        self.cx = fx + (tx - fx) * e as f64;
+        self.cy = fy + (ty - fy) * e as f64;
+        self.zoom = fz + (tz - fz) * e;
+        if self.cam_t >= 1.0 {
+            self.cam_from = None;
+            self.cam_to = None;
+        }
+        ctx.request_repaint();
+    }
+
     /// True while tile requests are still outstanding (drives the busy strip).
     pub fn tiles_pending(&self) -> bool {
         !self.pending.is_empty()
@@ -324,6 +371,7 @@ impl MapState {
 
     pub fn show(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         self.drain_tiles(ctx);
+        self.step_camera(ctx);
 
         // Header: mode toggle + hint.
         ui.horizontal(|ui| {
@@ -611,6 +659,67 @@ impl MapState {
             let r = Rect::from_two_pos(a, b);
             painter.rect_stroke(r, 0.0, stroke, egui::StrokeKind::Middle);
         }
+        // ---- live HUD: peaks found so far, then the winner ----
+        // Real data only: each marker is a scored candidate cell from the run.
+        let mut best: Option<([f32; 3], Pos2)> = None;
+        for p in &self.peaks {
+            if let Some(pos) = self.latlon_screen(p[0] as f64, p[1] as f64, rect) {
+                if !rect.contains(pos) {
+                    continue;
+                }
+                let conf = p[2].clamp(0.0, 1.0);
+                let r = 4.0 + 10.0 * conf;
+                let col = heat_color(conf);
+                painter.circle_filled(pos, r * 0.35, col.gamma_multiply(0.55));
+                painter.circle_stroke(pos, r, egui::Stroke::new(1.2, col));
+                if best.map(|(b, _)| p[2] > b[2]).unwrap_or(true) {
+                    best = Some((*p, pos));
+                }
+            }
+        }
+        if let Some((_, pos)) = best {
+            // Crosshair reticle on the current leader.
+            let s = egui::Stroke::new(1.0, Color32::from_white_alpha(180));
+            painter.line_segment([Pos2::new(pos.x - 16.0, pos.y), Pos2::new(pos.x - 5.0, pos.y)], s);
+            painter.line_segment([Pos2::new(pos.x + 5.0, pos.y), Pos2::new(pos.x + 16.0, pos.y)], s);
+            painter.line_segment([Pos2::new(pos.x, pos.y - 16.0), Pos2::new(pos.x, pos.y - 5.0)], s);
+            painter.line_segment([Pos2::new(pos.x, pos.y + 5.0), Pos2::new(pos.x, pos.y + 16.0)], s);
+        }
+        if let Some((lat, lon)) = self.winner {
+            if let Some(pos) = self.latlon_screen(lat, lon, rect) {
+                // Winner: pulsing ring, drawn from wall-clock so it breathes.
+                let t = painter.ctx().input(|i| i.time) as f32;
+                let pulse = 0.5 + 0.5 * (t * 2.4).sin();
+                let r = 18.0 + 10.0 * pulse;
+                painter.circle_stroke(
+                    pos,
+                    r,
+                    egui::Stroke::new(2.0, Color32::from_rgb(150, 60, 210).gamma_multiply(0.85)),
+                );
+                painter.circle_stroke(
+                    pos,
+                    6.0 + 2.0 * pulse,
+                    egui::Stroke::new(2.0, Color32::from_rgb(255, 255, 255)),
+                );
+                painter.line_segment(
+                    [Pos2::new(pos.x - 26.0, pos.y), Pos2::new(pos.x - 8.0, pos.y)],
+                    egui::Stroke::new(1.5, Color32::WHITE),
+                );
+                painter.line_segment(
+                    [Pos2::new(pos.x + 8.0, pos.y), Pos2::new(pos.x + 26.0, pos.y)],
+                    egui::Stroke::new(1.5, Color32::WHITE),
+                );
+                painter.text(
+                    Pos2::new(pos.x + 30.0, pos.y - 10.0),
+                    egui::Align2::LEFT_TOP,
+                    "LOCK",
+                    egui::FontId::monospace(12.0),
+                    Color32::WHITE,
+                );
+                painter.ctx().request_repaint();
+            }
+        }
+
         // Zoom readout, bottom-left: the header row can be crowded out.
         painter.text(
             Pos2::new(rect.max.x - 10.0, rect.min.y + 24.0),

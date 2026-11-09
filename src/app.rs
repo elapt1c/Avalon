@@ -115,6 +115,9 @@ pub struct App {
     // Intelligence.
     region: Vec<Bounds>,
     map: MapState,
+    /// Dedicated map shown while the locate runs, so solving is something you
+    /// watch rather than a bar you stare at.
+    solve_map: MapState,
     map_open: bool,
     map_purpose: MapPurpose,
     time_start_unix: Option<i64>,
@@ -193,6 +196,7 @@ impl App {
             // default quietly turns a "find it blind" run into a hint.
             region: Vec::new(),
             map: MapState::new(39.0, -98.0, 4.0),
+            solve_map: MapState::new(40.9, -73.5, 6.0),
             map_open: false,
             map_purpose: MapPurpose::Region,
             // Empty window on purpose: a guess written into the defaults becomes
@@ -415,6 +419,13 @@ impl App {
         self.score_history.clear();
         self.search_started = Some(std::time::Instant::now());
         self.show_processing = true;
+        // Fly the solve map to the region being searched and clear the HUD.
+        self.solve_map.peaks.clear();
+        self.solve_map.winner = None;
+        self.solve_map.clear_heatmap();
+        if let Some(b) = self.region.first() {
+            self.solve_map.fly_to_bounds(*b);
+        }
         let cancel = self.cancel.clone();
         cancel.store(false, std::sync::atomic::Ordering::Relaxed);
 
@@ -463,6 +474,7 @@ impl App {
                             self.score_history.remove(0);
                         }
                     }
+                    self.solve_map.peaks = snap.peaks.clone();
                     self.search_snapshot = Some(*snap);
                 }
                 Ok(SearchMsg::Log(msg)) => {
@@ -472,6 +484,10 @@ impl App {
                     }
                 }
                 Ok(SearchMsg::Done(result)) => {
+                    if let Some(b) = result.best.first() {
+                        self.solve_map.winner = Some((b.lat, b.lon));
+                        self.solve_map.peaks.clear();
+                    }
                     if let Some(best) = result.best.first() {
                         let err = haversine_m((best.lat, best.lon), TRUTH) / 1000.0;
                         crate::log::info(
@@ -1282,6 +1298,43 @@ impl App {
 
     /// Live processing dashboard: only measured values, throttled updates.
     fn processing_view(&mut self, ui: &mut egui::Ui) {
+        // While locating, the view IS the map: it flies to the search area, then
+        // draws the peaks as they are scored and locks onto the winner. The
+        // numeric dashboard stays one click away on the strip above.
+        let live = matches!(self.search, SearchState::Running { .. })
+            || (self.solve_map.winner.is_some() && self.search_result.is_some());
+        if live {
+            ui.horizontal(|ui| {
+                let stage = match &self.search {
+                    SearchState::Running { stage } => stage.clone(),
+                    _ => "complete".to_string(),
+                };
+                ui.label(
+                    RichText::new(stage.to_uppercase())
+                        .monospace()
+                        .size(10.0)
+                        .color(theme::MUTED),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if let Some(b) = self.search_result.as_ref().and_then(|r| r.best.first()) {
+                        ui.label(
+                            RichText::new(format!(
+                                "{:.4}, {:.4}  ·  {:.1} Hz",
+                                b.lat, b.lon, b.rmse_hz
+                            ))
+                            .monospace()
+                            .size(10.0)
+                            .color(theme::ACCENT_BRIGHT),
+                        );
+                    }
+                });
+            });
+            ui.separator();
+            let ctx = ui.ctx().clone();
+            self.solve_map.show(ui, &ctx);
+            return;
+        }
+
         // Outcome banner: running / complete / failed. A failed locate used to
         // drop straight back to the spectrogram, which looked like nothing
         // happened.
@@ -1904,6 +1957,25 @@ impl App {
         }
         self.map = crate::map::MapState::new(40.9, -73.4, 8.0);
         self.map.set_heatmap(ctx, &cells, step);
+        self.map.peaks = cells
+            .iter()
+            .filter(|c| c.score_hz > 0.0)
+            .step_by(37)
+            .take(10)
+            .map(|c| [c.lat as f32, c.lon as f32, (c.score_hz / 10.0).clamp(0.0, 1.0)])
+            .collect();
+        self.map.winner = Some((40.88, -73.52));
+        // Seed the HUD with the same synthetic field so the markers, reticle and
+        // winner ring can be reviewed without waiting for a real search.
+        self.solve_map = crate::map::MapState::new(40.9, -73.4, 8.0);
+        self.solve_map.set_heatmap(ctx, &cells, step);
+        self.solve_map.peaks = cells
+            .iter()
+            .filter(|c| c.score_hz > 0.0)
+            .take(12)
+            .map(|c| [c.lat as f32, c.lon as f32, (c.score_hz / 10.0).clamp(0.0, 1.0)])
+            .collect();
+        self.solve_map.winner = Some((40.88, -73.52));
         self.map.mode = crate::map::Mode::Pan;
     }
 }

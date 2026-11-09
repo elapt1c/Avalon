@@ -110,6 +110,8 @@ pub struct Snapshot {
     pub cells_matched: usize,
     /// Flight pairs scored so far.
     pub pairs_scored: usize,
+    /// Top cells found so far, for the live map: (lat, lon, score), best first.
+    pub peaks: Vec<[f32; 3]>,
 }
 
 struct Prepared {
@@ -519,7 +521,41 @@ pub fn run_search(
                 crate::log::rss_bytes() as f64 / 1e6
             ),
         );
-        score_cells(&mut frontier, &candidates_for, &prepared, &tracks, quality, (win0, win1));
+        // Score in blocks so the map gets a live feed instead of one update per
+        // level (level 0 alone can run for minutes).
+        {
+            const BLOCK: usize = 4_000;
+            let mut done = 0usize;
+            while done < frontier.len() {
+                let end = (done + BLOCK).min(frontier.len());
+                score_cells(
+                    &mut frontier[done..end],
+                    &candidates_for,
+                    &prepared,
+                    &tracks,
+                    quality,
+                    (win0, win1),
+                );
+                done = end;
+                let mut top: Vec<&Cell> = frontier[..end].iter().filter(|c| c.score > 0.0).collect();
+                top.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+                snap.peaks = top
+                    .iter()
+                    .take(12)
+                    .map(|c| [c.lat as f32, c.lon as f32, c.score])
+                    .collect();
+                if let Some(b) = top.first() {
+                    snap.best_score_hz = b.score;
+                    snap.best_lat = b.lat;
+                    snap.best_lon = b.lon;
+                }
+                snap.candidates_done = scored_total + end;
+                snap.candidates_total = snap.candidates_done;
+                snap.elapsed_s = t_start.elapsed().as_secs_f64();
+                snap.cells_matched = frontier[..end].iter().filter(|c| c.score.is_finite()).count();
+                on_progress(snap.clone());
+            }
+        }
         scored_total += frontier.len();
         snap.candidates_done = scored_total;
         snap.candidates_total = scored_total;
@@ -528,6 +564,14 @@ pub fn run_search(
         snap.elapsed_s = t_start.elapsed().as_secs_f64();
         snap.cells_matched =
             frontier.iter().filter(|c| c.score.is_finite()).count();
+        // Live peaks for the map view: the best few cells of this level.
+        let mut top: Vec<&Cell> = frontier.iter().filter(|c| c.score > 0.0).collect();
+        top.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        snap.peaks = top
+            .iter()
+            .take(12)
+            .map(|c| [c.lat as f32, c.lon as f32, c.score])
+            .collect();
         snap.detail = format!(
             "level {level} @ {:.0} m: {}/{} matched",
             step_m,
