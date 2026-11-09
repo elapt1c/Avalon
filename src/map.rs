@@ -726,15 +726,18 @@ fn world_y_to_lat(y: f64) -> f64 {
     n.sinh().atan().to_degrees()
 }
 
-/// Confidence colour: 0 = barely above the noise floor, 1 = the best cell found.
+/// Confidence colour: 0 = searched and rejected, 1 = the most likely receiver.
+/// Green (low) → teal → blue → red → purple (maximum confidence), the ramp the
+/// operator expects: purple is the answer.
 fn heat_color(t: f32) -> Color32 {
     let t = t.clamp(0.0, 1.0);
-    let stops: [(f32, (u8, u8, u8)); 5] = [
-        (0.00, (40, 70, 120)),    // cold: poor fit
-        (0.40, (60, 150, 180)),   // cyan
-        (0.65, (240, 190, 60)),   // amber
-        (0.85, (235, 90, 45)),    // red
-        (1.00, (255, 245, 210)),  // white-hot: best fit
+    let stops: [(f32, (u8, u8, u8)); 6] = [
+        (0.00, (40, 190, 90)),   // green: weakest survivor
+        (0.30, (60, 200, 160)),  // teal
+        (0.50, (60, 140, 200)),  // blue
+        (0.72, (230, 170, 60)),  // amber
+        (0.88, (230, 80, 60)),   // red
+        (1.00, (150, 60, 210)),  // purple: maximum confidence
     ];
     for i in 0..stops.len() - 1 {
         let (t0, c0) = stops[i];
@@ -747,5 +750,5 @@ fn heat_color(t: f32) -> Color32 {
             return Color32::from_rgb(r, g, b);
         }
     }
-    Color32::from_rgb(255, 245, 210)
+    Color32::from_rgb(150, 60, 210)
 }

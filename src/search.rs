@@ -59,6 +59,24 @@ const CPA_DT: f64 = 5.0;
 const SCORE_DT: f64 = 2.0;
 /// Clock-offset sweep half width (s) and coarse/fine step counts.
 const SHIFT_HALF_S: f64 = 10.0;
+
+/// Half-width (s) of the shared-start tolerance when pairing two flyovers.
+/// Distinct from the f0/clock sweep: this only decides whether two candidate
+/// flights are *allowed* to be scored as one recording. Tunable because the
+/// reference pair sits right on the edge of it.
+fn shift_half_s() -> f64 {
+    std::env::var("AOS_SHIFT_HALF_S")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(SHIFT_HALF_S)
+}
+
+fn pair_tol_s() -> f64 {
+    std::env::var("AOS_PAIR_TOL_S")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(SHIFT_HALF_S + 2.0)
+}
 const SHIFT_STEPS_COARSE: usize = 3;
 const SHIFT_STEPS_FINE: usize = 17;
 /// f0 sweep steps.
@@ -267,6 +285,26 @@ pub fn run_search(
         .map(|p| 2.0 * p.spec.half_width_s)
         .fold(0.0f64, f64::max);
     let slack = clip_len + 120.0;
+    if let Ok(list) = std::env::var("AVALON_DEBUG_ICAO") {
+        for name in list.split(',').map(|x| x.trim()).filter(|x| !x.is_empty()) {
+            match flights.iter().find(|f| f.icao.eq_ignore_ascii_case(name)) {
+                Some(f) => crate::log::info(
+                    "trace",
+                    &format!(
+                        "{} present in archive: {} points, t {:.0}..{:.0}, alt {:.0}..{:.0} m",
+                        name,
+                        f.points.len(),
+                        f.points.first().map(|p| p.t_s).unwrap_or(0.0),
+                        f.points.last().map(|p| p.t_s).unwrap_or(0.0),
+                        f.points.iter().map(|p| p.alt_m).fold(f64::INFINITY, f64::min),
+                        f.points.iter().map(|p| p.alt_m).fold(0.0, f64::max)
+                    ),
+                ),
+                None => crate::log::info("trace", &format!("{name} NOT in parsed archive")),
+            }
+        }
+    }
+
     let time_relevant: Vec<&Flight> = flights
         .iter()
         .filter(|f| {
@@ -309,6 +347,20 @@ pub fn run_search(
             Some((f.icao.clone(), coarse, fine))
         })
         .collect();
+    if let Ok(list) = std::env::var("AVALON_DEBUG_ICAO") {
+        for name in list.split(',').map(|x| x.trim()).filter(|x| !x.is_empty()) {
+            match tracks.iter().find(|t| t.0.eq_ignore_ascii_case(name)) {
+                Some(t) => crate::log::info(
+                    "trace",
+                    &format!("{} has a usable track: {} coarse / {} fine samples", name, t.1.pos.len(), t.2.pos.len()),
+                ),
+                None => crate::log::warn(
+                    "trace",
+                    &format!("{name} dropped during track building (region radius {:.0} km)", radius_m / 1000.0),
+                ),
+            }
+        }
+    }
     on_log(format!("{} usable tracks", tracks.len()));
 
     // Everything the scoring stage needs now lives in `tracks`; the parsed
@@ -674,7 +726,7 @@ pub fn run_search(
                 &prepared,
                 &tracks,
                 (win0, win1),
-                &score::shift_grid(SHIFT_HALF_S, SHIFT_STEPS_FINE),
+                &score::shift_grid(shift_half_s(), SHIFT_STEPS_FINE),
                 F0_STEPS_FINE,
             );
             // Report how closely the simulated curve tracks the measured one.
@@ -975,16 +1027,41 @@ fn build_track(
     if slice.len() < 2 {
         return None;
     }
-    let mean_alt: f64 =
-        slice.iter().map(|p| p.alt_m).sum::<f64>() / slice.len().max(1) as f64;
-    if mean_alt < 150.0 {
+    // Airworthiness is judged **around the closest approach**, not over the whole
+    // in-region slice. An aircraft that transits the box and then parks or taxis
+    // inside it (its home field may lie in the region) has a slice that is mostly
+    // on the ground, and the old mean-over-slice test threw it away — which is
+    // exactly what happened to one half of the reference pair. The flyover we are
+    // scoring is the close pass; judge that moment.
+    let cpa_idx = {
+        let mut best = (f64::INFINITY, 0usize);
+        for (i, p) in slice.iter().enumerate() {
+            let dlat = (p.lat - center.0) * 111_320.0;
+            let dlon = (p.lon - center.1) * 111_320.0 * center.0.to_radians().cos();
+            let d = (dlat * dlat + dlon * dlon).sqrt();
+            if d < best.0 {
+                best = (d, i);
+            }
+        }
+        best.1
+    };
+    let t_cpa = slice[cpa_idx].t_s;
+    let around: Vec<&crate::model::FlightPoint> = slice
+        .iter()
+        .filter(|p| (p.t_s - t_cpa).abs() <= 900.0)
+        .collect();
+    if around.len() < 2 {
         return None;
     }
-    // Ground speed from the raw samples: a parked or taxiing transponder is
-    // stationary to within a few m/s even though it sits inside the box all day.
+    let max_alt = around.iter().map(|p| p.alt_m).fold(0.0f64, f64::max);
+    if max_alt < 300.0 {
+        return None;
+    }
+    // Speed at the pass: a parked transponder is stationary even if it sits in
+    // the box all day, but a taxiing one still moves, so require real airspeed.
     let mut moved = 0.0f64;
     let mut dt_sum = 0.0f64;
-    for w in slice.windows(2) {
+    for w in around.windows(2) {
         let dt = w[1].t_s - w[0].t_s;
         if dt <= 0.0 {
             continue;
@@ -1045,6 +1122,24 @@ fn build_track(
 
 /// Score one candidate: prune flights by CPA band, pair events by time, then
 /// maximise the matched-filter brightness over f0 and the shared clock offset.
+
+/// Cell nominated by AVALON_DEBUG_CELL="lat,lon" for gate tracing.
+fn debug_cell() -> Option<(f64, f64)> {
+    let v = std::env::var("AVALON_DEBUG_CELL").ok()?;
+    let (a, b) = v.split_once(',')?;
+    Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+}
+
+mod gtracks {
+    /// Is this ICAO one of the flights from the published ground truth?
+    pub fn named(icao: &str) -> bool {
+        matches!(
+            std::env::var("AVALON_DEBUG_ICAO").ok().as_deref(),
+            Some(list) if list.split(',').any(|x| x.trim().eq_ignore_ascii_case(icao))
+        )
+    }
+}
+
 fn score_cell(
     obs: [f64; 3],
     cell: (f64, f64),
@@ -1054,6 +1149,44 @@ fn score_cell(
     quality: Quality,
     window: (f64, f64),
 ) -> (f32, f32, String) {
+    // Debug hook: print every gate decision for one nominated cell, so a cell
+    // that "scores 0.000" can be explained instead of guessed at.
+    let debug = debug_cell().map(|d| {
+        let dd = ((cell.0 - d.0) * 111_320.0).powi(2)
+            + ((cell.1 - d.1) * 111_320.0 * cell.0.to_radians().cos()).powi(2);
+        (dd.sqrt(), d)
+    });
+    let is_debug_cell = debug.map(|(m, _)| m < 400.0).unwrap_or(false);
+    if is_debug_cell {
+        crate::log::info(
+            "gate",
+            &format!(
+                "cell {:.4},{:.4}: {} candidate tracks, {} events",
+                cell.0,
+                cell.1,
+                candidates.len(),
+                prepared.len()
+            ),
+        );
+        // Is a published ground-truth aircraft even in the candidate set?
+        if let Ok(list) = std::env::var("AVALON_DEBUG_ICAO") {
+            for name in list.split(',').map(|x| x.trim()).filter(|x| !x.is_empty()) {
+                if let Some(ti) = tracks.iter().position(|t| t.0.eq_ignore_ascii_case(name)) {
+                    let in_cands = candidates.contains(&(ti as u32));
+                    let (d, _) = tracks[ti].1.cpa_stride(obs, 6).unwrap_or((f64::INFINITY, 0.0));
+                    crate::log::info(
+                        "gate",
+                        &format!(
+                            "  {name}: track #{ti} {} candidate list, cpa {:.1} km at this cell",
+                            if in_cands { "IS in" } else { "is NOT in" },
+                            d / 1000.0
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
     // Per event: flights whose closest approach implies a recording start that
     // falls inside the user's window. `implied = t_cpa_flight - cpa_audio`.
     // (track index, cpa distance, ground speed, implied recording start)
@@ -1067,10 +1200,22 @@ fn score_cell(
             let Some((d, t_cpa)) = coarse_track.cpa_stride(obs, stride) else { continue };
             // Loose geometric gate: any close pass is worth scoring.
             if d > 40_000.0 {
+                if is_debug_cell && gtracks::named(&tracks[ti as usize].0) {
+                    crate::log::info("gate", &format!("  {} rejected: cpa {:.1} km > 40", tracks[ti as usize].0, d / 1000.0));
+                }
                 continue;
             }
             let implied = t_cpa - p.spec.cpa_s;
             if implied < window.0 - 120.0 || implied > window.1 + 120.0 {
+                if is_debug_cell && gtracks::named(&tracks[ti as usize].0) {
+                    crate::log::info(
+                        "gate",
+                        &format!(
+                            "  {} rejected: implied start {:.0} outside window",
+                            tracks[ti as usize].0, implied
+                        ),
+                    );
+                }
                 continue;
             }
             // The aircraft must be in the right speed class, otherwise every
@@ -1083,12 +1228,24 @@ fn score_cell(
                 .map(|v| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt())
                 .unwrap_or(0.0);
             if gs < 0.5 * p.speed_mps || gs > 2.0 * p.speed_mps {
+                if is_debug_cell && gtracks::named(&tracks[ti as usize].0) {
+                    crate::log::info(
+                        "gate",
+                        &format!("  {} rejected: ground speed {:.0} m/s vs fitted {:.0}", tracks[ti as usize].0, gs, p.speed_mps),
+                    );
+                }
                 continue;
             }
             // The fitted slant is degenerate (it trades against speed), so allow
             // a wide factor. Evidence: at the true receiver the real pass was
             // 10.7 km while the audio fit said 5.9 km.
             if d < 0.1 * p.slant_m || d > 8.0 * p.slant_m {
+                if is_debug_cell && gtracks::named(&tracks[ti as usize].0) {
+                    crate::log::info(
+                        "gate",
+                        &format!("  {} rejected: cpa {:.1} km vs fitted slant {:.1} km", tracks[ti as usize].0, d / 1000.0, p.slant_m / 1000.0),
+                    );
+                }
                 continue;
             }
             keep.push((ti as usize, d, gs, implied));
@@ -1108,7 +1265,7 @@ fn score_cell(
         per_event.push(keep);
     }
 
-    let shift_grid: Vec<f64> = score::shift_grid(SHIFT_HALF_S, quality.shift_steps());
+    let shift_grid: Vec<f64> = score::shift_grid(shift_half_s(), quality.shift_steps());
     let f0_steps = quality.f0_steps();
     let frame_step = quality.frame_step();
 
@@ -1126,7 +1283,7 @@ fn score_cell(
         // candidates by implied start so that constraint is a hash lookup rather
         // than an all-pairs scan — this is what makes a continental region
         // tractable, and it is far stronger evidence than speed similarity.
-        let tol = SHIFT_HALF_S + 2.0;
+        let tol = pair_tol_s();
         let mut by_start: std::collections::HashMap<i64, Vec<(usize, f64)>> =
             std::collections::HashMap::new();
         for &(i1, _d1, _v1, base1) in &per_event[1] {
@@ -1143,6 +1300,34 @@ fn score_cell(
                 }
             }
         }
+        if is_debug_cell {
+            if let Ok(list) = std::env::var("AVALON_DEBUG_ICAO") {
+                let names: Vec<String> = list.split(',').map(|x| x.trim().to_string()).collect();
+                for (ev, keep) in per_event.iter().enumerate() {
+                    for (ti, d, gs, implied) in keep {
+                        if names.iter().any(|n| n.eq_ignore_ascii_case(&tracks[*ti].0)) {
+                            crate::log::info(
+                                "gate",
+                                &format!(
+                                    "  event {ev} {}: cpa {:.1} km, gs {:.0} m/s, implied start {:.1}",
+                                    tracks[*ti].0, d / 1000.0, gs, implied
+                                ),
+                            );
+                        }
+                    }
+                }
+                let truth_pair = names.len() >= 2
+                    && cands.iter().any(|(i0, i1, _)| {
+                        tracks[*i0].0.eq_ignore_ascii_case(&names[0])
+                            && tracks[*i1].0.eq_ignore_ascii_case(&names[1])
+                    });
+                crate::log::info(
+                    "gate",
+                    &format!("  truth pair present in candidate pairs: {truth_pair} ({} pairs)", cands.len()),
+                );
+            }
+        }
+
         // Rank those pairs by a cheap residual of the *subsampled* curves before
         // paying for the full f0 / clock sweep on the best few.
         let mut pairs: Vec<(f64, usize, usize, f64)> = Vec::with_capacity(cands.len());
@@ -1174,7 +1359,11 @@ fn score_cell(
             }
         }
         pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-        pairs.truncate(CELL_PAIRS);
+        let cell_pairs = std::env::var("AOS_CELL_PAIRS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(CELL_PAIRS);
+        pairs.truncate(cell_pairs);
         let mut scored: Vec<f32> = Vec::with_capacity(pairs.len());
         let mut top = f32::NEG_INFINITY;
         let mut top_name = String::new();
@@ -1603,7 +1792,7 @@ fn model_curves_at(
                 }
                 let t1 = &tracks[ti1 as usize].1;
                 let Some((_, cpa1)) = t1.cpa(obs) else { continue };
-                if ((cpa1 - prepared[1].spec.cpa_s) - base0).abs() > SHIFT_HALF_S + 20.0 {
+                if ((cpa1 - prepared[1].spec.cpa_s) - base0).abs() > shift_half_s() + 20.0 {
                     continue;
                 }
                 for &sh in shifts {
