@@ -183,25 +183,19 @@ impl App {
             autostart,
             show_intel: false,
             selected_path: None,
-            // Default test region: ~50 miles around the known true location of
-            // the test footage, so accuracy is measurable.
-            region: vec![Bounds {
-                west: TRUTH.1 - 0.9555,
-                south: TRUTH.0 - 0.7226,
-                east: TRUTH.1 + 0.9555,
-                north: TRUTH.0 + 0.7226,
-            }],
+            // No pre-filled region: the operator draws the search box. A stale
+            // default quietly turns a "find it blind" run into a hint.
+            region: Vec::new(),
             map: MapState::new(39.0, -98.0, 4.0),
             map_open: false,
             map_purpose: MapPurpose::Region,
-            // The reference recording was made 2026-09-08 near Oyster Bay NY; its
-            // two flyovers fall at 20:53Z and 21:09Z, so the default window spans
-            // that evening rather than the whole day.
-            time_start_unix: Some(dateutil::civil_to_unix(default_year(), 9, 8, 18, 0, 0)),
-            time_end_unix: Some(dateutil::civil_to_unix(default_year(), 9, 8, 23, 30, 0)),
+            // Empty window on purpose: a guess written into the defaults becomes
+            // an invisible prior. Both ends are set from the calendar.
+            time_start_unix: None,
+            time_end_unix: None,
             cal_open: false,
             cal_target: CalTarget::Start,
-            cal_year: 2026,
+            cal_year: default_year(),
             cal_month: 1,
             cal_day: 1,
             cal_hour: 0,
@@ -874,7 +868,11 @@ impl App {
                     Some(r) => r.events.len().to_string(),
                     None => "0".to_string(),
                 };
-                let regions = format!("{} BOX", self.region.len());
+                let regions = if self.region.is_empty() {
+                    "—".to_string()
+                } else {
+                    format!("{} BOX", self.region.len())
+                };
                 let archive = self.provider.to_uppercase();
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
                     theme::kv(ui, "archive", &archive, theme::DIM);
