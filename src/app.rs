@@ -149,6 +149,9 @@ pub struct App {
     search_started: Option<std::time::Instant>,
     /// Keep the locate dashboard in the main area until the user dismisses it.
     show_processing: bool,
+    /// Whether the intelligence column is docked. Hidden by default so the canvas
+    /// gets the full width; its controls stay one click away in the top strip.
+    show_intel: bool,
     /// Test hook: run the locate automatically once analysis finishes.
     auto_run: bool,
     /// Clip to open and analyse on the first frame (test hook).
@@ -178,6 +181,7 @@ impl App {
         Self {
             auto_run,
             autostart,
+            show_intel: false,
             selected_path: None,
             // Default test region: ~50 miles around the known true location of
             // the test footage, so accuracy is measurable.
@@ -654,7 +658,9 @@ impl App {
         }
         self.top_bar(ui);
         self.source_panel(ui);
-        self.intel_panel(ui);
+        if self.show_intel {
+            self.intel_panel(ui);
+        }
         self.status_bar(ui);
         self.central_panel(ui);
     }
@@ -714,6 +720,33 @@ impl App {
                             }
                         };
                         theme::pill(ui, txt, col);
+                        ui.add_space(10.0);
+                        let intel = egui::Button::new(
+                            egui::RichText::new(if self.show_intel { "◨ INTEL" } else { "◧ INTEL" })
+                                .monospace()
+                                .size(10.0),
+                        )
+                        .selected(self.show_intel);
+                        if ui.add(intel).on_hover_text("dock the intelligence column").clicked() {
+                            self.show_intel = !self.show_intel;
+                        }
+                        if !self.show_intel {
+                            ui.add_space(6.0);
+                            let busy = matches!(self.search, SearchState::Running { .. });
+                            if ui
+                                .add_enabled(
+                                    !busy,
+                                    egui::Button::new(
+                                        egui::RichText::new("▸ LOCATE").monospace().size(10.0),
+                                    ),
+                                )
+                                .on_hover_text("run the locate with the current region + window")
+                                .clicked()
+                            {
+                                self.show_processing = true;
+                                self.start_search();
+                            }
+                        }
                         ui.add_space(14.0);
                         ui.label(
                             egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
@@ -737,6 +770,7 @@ impl App {
             .min_size(240.0)
             .max_size(420.0)
             .show(ui, |ui| {
+                ui.set_max_width(ui.available_width());
                 ui.add_space(2.0);
                 ui.label(
                     egui::RichText::new("SOURCE INGEST")
@@ -863,6 +897,7 @@ impl App {
             // lines, squeezing the spectrogram and overriding the stored width.
             .max_size(420.0)
             .show(ui, |ui| {
+                ui.set_max_width(ui.available_width());
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
@@ -920,10 +955,14 @@ impl App {
                             self.open_calendar(CalTarget::End);
                         }
                     });
-                    ui.label(
-                        RichText::new("Searching all of history is infeasible — a window is required.")
-                            .color(theme::MUTED)
-                            .small(),
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new("A window is required — no full-history search.")
+                                .monospace()
+                                .size(10.0)
+                                .color(theme::DIM),
+                        )
+                        .wrap(),
                     );
 
                     ui.separator();
