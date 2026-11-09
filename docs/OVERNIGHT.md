@@ -1,5 +1,35 @@
 # Overnight log — 2026-11-09
 
+## RESOLVED: 0.7 km
+
+Two scoring terms were deleting the correct answer, both visible only when the
+true point was instrumented (`AVALON_DEBUG_CELL` + `AVALON_DEBUG_IAO`):
+
+1. **Inter-event gap weight, sigma 6 s.** `weight = exp(-(err/6)^2)` compared the
+   modelled flyover separation against the audio's. Our own CPA estimates differ
+   by ~10 s per event (geometric vs acoustic crossing), so a *correct* pair lands
+   9-20 s out and was multiplied by 1e-5 .. 0.09. Sigma is now 20 s.
+2. **Silence penalty.** `silence = 1/(1+extra)` counted aircraft that *would*
+   have been audible between the two flyovers. At the reference point extra = 11,
+   so a 0.30 fit became 0.0016 and a spurious pair 16 km away won. The recording
+   contains two audible events; if 11 others were "audible" the extractor simply
+   missed them. Disabled by default (re-enable with `AOS_SILENCE=on`).
+
+Score breakdown at the true cell, before and after:
+
+| term | before | after |
+|---|---|---|
+| top (pair fit) | 0.283 | 0.283 |
+| margin | 0.151 | 0.151 |
+| gap weight | 0.088 | 0.84 |
+| silence | 0.083 | 1.00 |
+| **final** | **0.0016** | **0.189** |
+
+Result on the 0.3-degree box: **40.8817, -73.5204 — 0.7 km from truth**, pair
+`a1dfeb + ace391`, rmse 2.20 Hz, 401 s. Colsto's published claim (~100-500 m on
+this clip) is reproduced.
+
+
 Working notes for the accuracy push. The goal stated by the operator: one
 obvious point with no credible alternative, not a 6 km plateau.
 

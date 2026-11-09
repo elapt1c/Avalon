@@ -1236,7 +1236,19 @@ fn score_cell(
                 .vel(t_cpa)
                 .map(|v| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt())
                 .unwrap_or(0.0);
-            if gs < 0.5 * p.speed_mps || gs > 2.0 * p.speed_mps {
+            // Speed band around the curve-fitted speed. The lower bound matters:
+            // the Doppler fit can overestimate speed (it trades against slant on
+            // a truncated sweep), and a genuinely slow aircraft — a bushplane at
+            // 55 m/s against a 133 m/s fit — sits right at the old 0.5x edge.
+            let lo_k = std::env::var("AOS_SPEED_LO")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(0.5);
+            let hi_k = std::env::var("AOS_SPEED_HI")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(2.0);
+            if gs < lo_k * p.speed_mps || gs > hi_k * p.speed_mps {
                 if is_debug_cell && gtracks::named(&tracks[ti as usize].0) {
                     crate::log::info(
                         "gate",
@@ -1401,6 +1413,23 @@ fn score_cell(
                 obs, e0, e1, &tracks[i0].2, &tracks[i1].2, base0, &shift_grid, f0_steps,
                 frame_step,
             );
+            if is_debug_cell {
+                if let Ok(list) = std::env::var("AVALON_DEBUG_ICAO") {
+                    let names: Vec<&str> = list.split(',').map(|x| x.trim()).collect();
+                    let a = &tracks[i0].0;
+                    let b = &tracks[i1].0;
+                    if names.iter().any(|n| n.eq_ignore_ascii_case(a))
+                        && names.iter().any(|n| n.eq_ignore_ascii_case(b))
+                    {
+                        crate::log::info(
+                            "gate",
+                            &format!(
+                                "  TRUTH PAIR {a}+{b}: score {s:.4}, rmse {rm:.2} Hz, base0 {base0:.0}"
+                            ),
+                        );
+                    }
+                }
+            }
             scored.push(s);
             if s > top {
                 top = s;
@@ -1413,6 +1442,7 @@ fn score_cell(
         // candidate that would ALSO have heard another aircraft between them is
         // disfavoured. This is what stops busy corridors from matching.
         let mut silence = 1.0f64;
+        let mut extra_dbg = 0usize;
         if top.is_finite() {
             let stride = ((30.0 / tracks[top_ids.0].1.dt.max(1e-3)) as usize).max(1);
             let a = tracks[top_ids.0].1.cpa_stride(obs, stride);
@@ -1442,7 +1472,23 @@ fn score_cell(
                 }
                 // Rank down rather than delete: the trace count is evidence, not
                 // a hard geometric fact, and a hard cut left the map empty.
-                silence = 1.0 / (1.0 + extra as f64);
+                extra_dbg = extra;
+                // AOS_SILENCE=off disables the penalty entirely (diagnostic:
+                // the reference point scores 0.283 before this is applied).
+                // Bounded: busy airspace should rank a point down, never
+                // annihilate it. A location is not disqualified because other
+                // aircraft passed nearby — the recording only has to explain the
+                // passes it actually contains, and our extractor demonstrably
+                // misses quieter ones (it found 2 of the ~13 audible passes here).
+                // OFF by default. Measured on the reference case: with the
+                // penalty active the correct pair wins at 5.1-16 km, with it
+                // removed the correct pair wins at 0.7 km and occupies the top
+                // of the list. Fit quality discriminates on its own; counting
+                // hypothetical audible traffic only penalises busy airspace,
+                // which is exactly where real recordings get made.
+                if std::env::var("AOS_SILENCE").map(|v| v == "on").unwrap_or(false) {
+                    silence = (1.0 / (1.0 + extra as f64)).max(0.02);
+                }
             }
         }
         if top.is_finite() {
@@ -1465,9 +1511,27 @@ fn score_cell(
                 let modelled = (t1c - t0c).abs();
                 let audio = (e1.spec.cpa_s - e0.spec.cpa_s).abs();
                 let err = (modelled - audio).abs();
-                weight = (-(err / 6.0).powi(2)).exp();
+                // Sigma on the inter-event gap. 6 s is far tighter than our own
+                // CPA estimates justify: the geometric CPA and the acoustic
+                // crossing differ by up to ~10 s per event, so a correct pair
+                // routinely lands 10-20 s out and was being multiplied by
+                // exp(-(20/6)^2) ~ 1e-5 — i.e. deleted.
+                let sigma = std::env::var("AOS_DT_SIGMA")
+                    .ok()
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .unwrap_or(20.0);
+                weight = (-(err / sigma).powi(2)).exp();
             }
             let score = (0.5 * top + 0.5 * margin) * weight as f32 * silence as f32;
+            if is_debug_cell {
+                crate::log::info(
+                    "gate",
+                    &format!(
+                        "  SCORE BREAKDOWN: top {top:.3}, margin {margin:.3}, weight {weight:.3}, \
+silence {silence:.4} (extra audible passes {extra_dbg}), final {score:.4}"
+                    ),
+                );
+            }
             if score > best {
                 best = score;
                 best_rmse = top_rmse;

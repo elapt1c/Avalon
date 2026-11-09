@@ -221,6 +221,15 @@ fn main() -> anyhow::Result<()> {
                         haversine((c.lat, c.lon), truth) / 1000.0
                     );
                 }
+                // Full cell dump for offline rendering: lat,lon,score,rmse
+                if let Ok(path) = std::env::var("AOS_DUMP_CELLS") {
+                    use std::io::Write;
+                    let mut f = std::fs::File::create(&path)?;
+                    for c in &r.cells {
+                        writeln!(f, "{:.5},{:.5},{:.5},{:.3}", c.lat, c.lon, c.score_hz, c.rmse_hz)?;
+                    }
+                    println!("dumped {} cells to {path}", r.cells.len());
+                }
                 if let Some(p) = jsonl.as_ref() {
                     use std::io::Write;
                     let mut f = std::fs::OpenOptions::new().create(true).append(true).open(p)?;
