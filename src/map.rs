@@ -333,13 +333,30 @@ impl MapState {
         let cx = (lon_to_world_x(b.west) + lon_to_world_x(b.east)) * 0.5;
         let span_y = (y_n - y_s).abs().max(1e-6);
         let span_x = (lon_to_world_x(b.east) - lon_to_world_x(b.west)).abs().max(1e-6);
-        // Screen is ~900 px tall in the solve view; pick the zoom that fits the
-        // larger of the two spans with a little margin.
+        // Fit the box into a ~900 px viewport: at zoom z the whole world is
+        // 256*2^z px, so the largest span must occupy at most VIEWPORT px.
+        const VIEWPORT: f64 = 860.0;
         let span = span_x.max(span_y);
-        let zoom = (1.0f64 / span / 1.4).log2().clamp(2.0, 17.0) as f32;
+        let zoom = (VIEWPORT / (256.0 * span)).log2().clamp(2.0, 17.0) as f32;
         self.cam_from = Some((self.cx, self.cy, self.zoom));
         self.cam_to = Some((cx, cy, zoom));
         self.cam_t = 0.0;
+    }
+
+    /// Jump straight to the fitted view (no animation), used on the first frame
+    /// of a run so the map opens on the search area rather than flying in.
+    pub fn snap_to_bounds(&mut self, b: Bounds) {
+        if !b.valid() {
+            return;
+        }
+        self.fly_to_bounds(b);
+        if let Some((cx, cy, z)) = self.cam_to.take() {
+            self.cx = cx;
+            self.cy = cy;
+            self.zoom = z;
+        }
+        self.cam_from = None;
+        self.cam_t = 1.0;
     }
 
     /// Fly to a set of points (lat, lon) with padding — used to frame the
@@ -666,9 +683,11 @@ impl MapState {
                     continue;
                 }
                 if !self.failed.contains(&key) {
-                    painter.rect_filled(screen, 0.0, crate::theme::PANEL.gamma_multiply(0.8));
+                    // Night-tile-ish slate, not black: an empty map should read
+                    // as "loading", not as a rendering failure.
+                    painter.rect_filled(screen, 0.0, Color32::from_rgb(16, 26, 38));
                 } else {
-                    painter.rect_filled(screen, 0.0, crate::theme::BG.gamma_multiply(1.4));
+                    painter.rect_filled(screen, 0.0, Color32::from_rgb(12, 18, 26));
                 }
             }
         }

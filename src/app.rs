@@ -430,7 +430,10 @@ impl App {
         self.solve_map.winner = None;
         self.solve_map.clear_heatmap();
         if let Some(b) = self.region.first() {
+            // Jump first, then fly: starting from an unrelated location meant a
+            // black screen while tiles for both places loaded.
             self.solve_map.fly_to_bounds(*b);
+            self.solve_map.snap_to_bounds(*b);
         }
         let cancel = self.cancel.clone();
         cancel.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -2044,6 +2047,15 @@ impl eframe::App for App {
         if std::env::var("AVALON_MAP").is_ok() && !self.map_open {
             self.map_open = true;
             self.map_purpose = MapPurpose::Heatmap;
+            // Optional: open fitted to a box, for checking the zoom maths.
+            if let Ok(v) = std::env::var("AVALON_FIT") {
+                let p: Vec<f64> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+                if p.len() == 4 {
+                    self.map.snap_to_bounds(crate::model::Bounds {
+                        west: p[0], south: p[1], east: p[2], north: p[3],
+                    });
+                }
+            }
         }
         if std::env::var("AVALON_HEAT_DEMO").is_ok() && self.map_heat_none() {
             self.demo_heatmap(&ctx);
