@@ -1516,7 +1516,16 @@ fn score_cell(
                 // as far away sits ~6 dB lower and is masked by the recording's
                 // own noise floor; treating any aircraft within 12 km as audible
                 // vetoed every candidate in a busy terminal area.
-                let audible = (d0.max(d1) * 2.0).max(4_000.0);
+                // DG rule: the audible radius is max(slant_1, slant_2) taken from
+                // the *fit*, with no distance multiplier — a hearing heuristic
+                // used as a reject, not a score penalty.
+                let audible = if crate::score::dg_mode() {
+                    let s0 = e0.slant_m as f64;
+                    let s1 = e1.slant_m as f64;
+                    s0.max(s1).max(2_000.0)
+                } else {
+                    (d0.max(d1) * 2.0).max(4_000.0)
+                };
                 let mut extra = 0usize;
                 for &tj in candidates {
                     if tj as usize == top_ids.0 || tj as usize == top_ids.1 {
@@ -1546,7 +1555,13 @@ fn score_cell(
                 // of the list. Fit quality discriminates on its own; counting
                 // hypothetical audible traffic only penalises busy airspace,
                 // which is exactly where real recordings get made.
-                if std::env::var("AOS_SILENCE").map(|v| v == "on").unwrap_or(false) {
+                if crate::score::dg_mode() {
+                    // Reject outright when an unaccounted propeller flyover would
+                    // have been heard between the two events.
+                    if extra > 0 {
+                        silence = 0.0;
+                    }
+                } else if std::env::var("AOS_SILENCE").map(|v| v == "on").unwrap_or(false) {
                     silence = (1.0 / (1.0 + extra as f64)).max(0.02);
                 }
             }

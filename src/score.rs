@@ -662,6 +662,12 @@ pub fn curve_rmse(
 /// (visible as a vertical bias against the spectrogram), and a pure offset is
 /// not absorbable by scale: at 180 Hz, 3 Hz is 1.7 %.
 #[allow(clippy::too_many_arguments)]
+/// Runtime switch for the alternative (DOPPLERGEIST-style) backend.
+pub fn dg_mode() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var("AOS_METHOD").map(|v| v == "dg").unwrap_or(false))
+}
+
 pub fn curve_rmse_offset(
     samples: &[(f64, f32)],
     track: &Track,
@@ -694,6 +700,16 @@ pub fn curve_rmse_offset(
         };
         let f_model = f0 * ratio + f_offset;
         let e = f_model - f_meas as f64;
+        // DG method: pseudo-Huber instead of squared error, so a handful of bad
+        // ridge samples cannot dominate the fit. Scale is the declared loss
+        // scale (1 Hz default in their configuration).
+        if dg_mode() {
+            let delta = 1.0f64;
+            let r = e.abs();
+            sum += 2.0 * delta * delta * ((1.0 + (r / delta).powi(2)).sqrt() - 1.0);
+            n += 1;
+            continue;
+        }
         if e.abs() > max_err_hz as f64 {
             // Grossly wrong sample: penalise but keep going so a single bad
             // ridge point cannot make the whole curve look perfect.
