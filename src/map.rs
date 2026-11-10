@@ -19,7 +19,6 @@ const TILE: f64 = 256.0;
 /// egui's smoothed delta (measured), so this is "one notch = one level".
 const NOTCH_PX: f64 = 80.0;
 /// Heatmap raster is downsampled to at most this many texels per side.
-const HEAT_MAX_TEXELS: usize = 1024;
 
 type TileKey = (u32, u32, u32);
 type TileResult = (TileKey, Vec<u8>, (usize, usize));
@@ -33,7 +32,6 @@ pub enum Mode {
 /// A rasterised candidate field drawn under the selection rectangles.
 struct Heat {
     bounds: Bounds,
-    tex: TextureHandle,
     /// Survivors as a point cloud: (lat, lon, confidence). Drawn as fixed-size
     /// screen-space dots, so zooming in separates them instead of smearing the
     /// field — the QGIS read: solid at a distance, individual points up close.
@@ -147,7 +145,7 @@ impl MapState {
     ///
     /// Confidence, not error, drives the colour: a cell whose fit is near the
     /// best of the field is the one worth looking at, so it gets the hot end.
-    pub fn set_heatmap(&mut self, ctx: &egui::Context, cells: &[HeatmapCell], step_deg: f64) {
+    pub fn set_heatmap(&mut self, _ctx: &egui::Context, cells: &[HeatmapCell], step_deg: f64) {
         if cells.is_empty() {
             self.heat = None;
             return;
@@ -199,86 +197,8 @@ impl MapState {
         let hi = sorted[((sorted.len() as f64 * 0.98) as usize).min(sorted.len() - 1)];
         let span = (hi - lo).max(1e-6);
 
-        // Survivors are a handful of cells in a 60k-cell grid, so painting one
-        // texel each is invisible at the zoom a searched 2-degree box is viewed
-        // at. Splat a Gaussian per survivor: the result reads as a heat field
-        // with an opaque core, and overlapping survivors reinforce each other.
-        const SIGMA: f32 = 1.8;
-        const RADIUS: isize = 5;
-        let two_sigma_sq = 2.0 * SIGMA * SIGMA;
-        let mut field = vec![0.0f32; cols * rows];
-        for cy in 0..rows {
-            for cx in 0..cols {
-                let v = vals[cy * cols + cx];
-                if v <= 0.0 {
-                    continue;
-                }
-                // score_hz is a composite where higher is better, so the
-                // normalised value *is* the confidence.
-                let conf = ((v - lo) / span).clamp(0.0, 1.0);
-                let weight = 0.30 + 0.70 * conf;
-                for dy in -RADIUS..=RADIUS {
-                    let yy = cy as isize + dy;
-                    if yy < 0 || yy >= rows as isize {
-                        continue;
-                    }
-                    for dx in -RADIUS..=RADIUS {
-                        let xx = cx as isize + dx;
-                        if xx < 0 || xx >= cols as isize {
-                            continue;
-                        }
-                        let d2 = (dx * dx + dy * dy) as f32;
-                        field[yy as usize * cols + xx as usize] +=
-                            weight * (-d2 / two_sigma_sq).exp();
-                    }
-                }
-            }
-        }
-
-        // Max-pool down to a texture size every GPU accepts, keeping peaks.
-        let ds = ((cols.max(rows) as f64) / HEAT_MAX_TEXELS as f64).ceil().max(1.0) as usize;
-        let out_cols = cols.div_ceil(ds);
-        let out_rows = rows.div_ceil(ds);
-        // Scale to the field's own maximum: overlapping splats saturate the core
-        // instantly, which collapsed the whole ramp into purple.
-        let field_max = field.iter().cloned().fold(0.0f32, f32::max).max(1e-6);
-        let mut pixels = Vec::with_capacity(out_cols * out_rows);
-        for oy in 0..out_rows {
-            for ox in 0..out_cols {
-                let mut best = 0.0f32;
-                let mut any_elim = false;
-                for dy in 0..ds {
-                    let y = oy * ds + dy;
-                    if y >= rows {
-                        break;
-                    }
-                    for dx in 0..ds {
-                        let x = ox * ds + dx;
-                        if x >= cols {
-                            break;
-                        }
-                        let i = y * cols + x;
-                        best = best.max(field[i]);
-                        any_elim |= elim[i];
-                    }
-                }
-                if best > 0.004 {
-                    // Gamma < 1 spreads the mid-range so the ramp is legible.
-                    let v = (best / field_max).clamp(0.0, 1.0).powf(0.55);
-                    let c = heat_color(v);
-                    let a = (150.0 + 105.0 * v.powf(0.6)) as u8;
-                    pixels.push(Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a));
-                } else if any_elim {
-                    // Eliminated: a faint wash so the searched box still reads as
-                    // "covered", without drowning the survivors.
-                    pixels.push(Color32::from_rgba_unmultiplied(58, 168, 96, 34));
-                } else {
-                    pixels.push(Color32::TRANSPARENT);
-                }
-            }
-        }
-
-        // Point cloud for the dot rendering (full resolution, not pooled).
+        // One dot per surviving cell, drawn at its own confidence: no pooling and
+        // no blur, so zooming in resolves individual samples.
         let mut points: Vec<[f32; 3]> = Vec::with_capacity(survivors);
         for cy in 0..rows {
             for cx in 0..cols {
@@ -293,8 +213,6 @@ impl MapState {
             }
         }
 
-        let image = egui::ColorImage::new([out_cols, out_rows], pixels);
-        let handle = ctx.load_texture("search_heatmap", image, egui::TextureOptions::LINEAR);
         // Store the covered box, expanded by half a cell so cells sit centred.
         self.heat = Some(Heat {
             bounds: Bounds {
@@ -303,7 +221,6 @@ impl MapState {
                 east: e + step / 2.0,
                 north: n + step / 2.0,
             },
-            tex: handle,
             points,
             survivors,
             best_rmse,
