@@ -766,6 +766,129 @@ pub fn curve_rmse_offset(
     Some((sum / n as f64).sqrt())
 }
 
+/// Closed-form rest frequency and offset.
+///
+/// The model is `f = f0 * ratio(t) + offset`, and `ratio` depends only on
+/// geometry — never on `f0`. So for a given cell and clock shift the optimal
+/// pair (f0, offset) is an ordinary two-parameter least squares, not something
+/// that needs a 12 x 5 grid search. One pass accumulates the normal equations;
+/// a second pass evaluates the actual loss (Huber when the dg backend is on)
+/// at that optimum.
+///
+/// Returns `(rmse_hz, f0)`.
+#[allow(clippy::too_many_arguments)]
+pub fn curve_fit_closed(
+    samples: &[(f64, f32)],
+    track: &Track,
+    obs: [f64; 3],
+    base_abs: f64,
+    shift_s: f64,
+    atm: Atmos,
+    max_err_hz: f32,
+    f0_prior: f64,
+    band_frac: f64,
+) -> Option<(f64, f64)> {
+    if samples.len() < 6 {
+        return None;
+    }
+    let mut ratios: Vec<f64> = Vec::with_capacity(samples.len());
+    let mut unresolved = 0usize;
+    let (mut n, mut sa, mut saa, mut sy, mut say, mut syy) = (0f64, 0f64, 0f64, 0f64, 0f64, 0f64);
+    let mut tau = base_abs + samples[0].0 - shift_s - 2000.0 / atm.c;
+    for &(t_rel, f_meas) in samples {
+        ratios.push(f64::NAN);
+        let model_t = base_abs + t_rel - shift_s;
+        match doppler_ratio_warm(track, obs, model_t, &mut tau, atm) {
+            Some(r) => {
+                let y = f_meas as f64;
+                n += 1.0;
+                sa += r;
+                saa += r * r;
+                sy += y;
+                say += r * y;
+                syy += y * y;
+                *ratios.last_mut().unwrap() = r;
+            }
+            None => {
+                tau = model_t - 2000.0 / atm.c;
+                unresolved += 1;
+            }
+        }
+    }
+    if n < 6.0 || unresolved as f64 > 0.2 * samples.len() as f64 {
+        return None;
+    }
+    let det = n * saa - sa * sa;
+    if det.abs() < 1e-9 {
+        return None;
+    }
+    let f0 = (n * say - sa * sy) / det;
+    // Same freedom budget as the grid sweep it replaces. A candidate whose OPTIMAL
+    // rest frequency needs more rope than that must be rejected, not scored on a
+    // clipped fit: clamping handed wrong pairs an exact fit at the band edge and
+    // a 9 km answer won. `band_frac` is passed by the caller because the coarse
+    // pair pre-rank historically allowed a wider ±12 % than the full sweep.
+    let band = f0_prior * band_frac;
+    if !f0.is_finite() || f0 <= 0.0 || (f0 - f0_prior).abs() > band {
+        return None;
+    }
+    let offset = (sy - f0 * sa) / n;
+    let _ = syy;
+
+    let dg = dg_mode();
+    let (mut loss, mut m_min, mut m_max) = (0f64, f64::INFINITY, f64::NEG_INFINITY);
+    for (i, &(_, f_meas)) in samples.iter().enumerate() {
+        let r = ratios[i];
+        let f_model = if r.is_nan() {
+            max_err_hz as f64
+        } else {
+            f0 * r + offset
+        };
+        if !r.is_nan() {
+            m_min = m_min.min(f_model);
+            m_max = m_max.max(f_model);
+            let e = f_model - f_meas as f64;
+            if dg {
+                let delta = 1.0f64;
+                let a = e.abs();
+                loss += 2.0 * delta * delta * ((1.0 + (a / delta).powi(2)).sqrt() - 1.0);
+            } else if e.abs() > max_err_hz as f64 {
+                loss += (max_err_hz as f64).powi(2);
+            } else {
+                loss += e * e;
+            }
+        } else {
+            loss += (max_err_hz as f64).powi(2);
+        }
+    }
+    if m_max.is_finite() {
+        let mut f_min = f32::INFINITY;
+        let mut f_max = f32::NEG_INFINITY;
+        for &(_, f) in samples {
+            f_min = f_min.min(f);
+            f_max = f_max.max(f);
+        }
+        let measured_drop = (f_max - f_min) as f64;
+        if measured_drop > 2.0 {
+            let model_drop = m_max - m_min;
+            if (model_drop - measured_drop).abs() > 0.25 * measured_drop {
+                return None;
+            }
+        }
+    }
+    Some(((loss / samples.len() as f64).sqrt(), f0))
+}
+
+/// True when the closed-form f0/offset solve replaces the grid sweep.
+pub fn closed_solve() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("AOS_F0_SOLVE")
+            .map(|v| v == "closed")
+            .unwrap_or(false)
+    })
+}
+
 /// f0 sweep grid (±8 %, as in the reference: straight-line fits are biased by
 /// several percent when the aircraft descends or slows).
 pub fn f0_grid(f0: f64, steps: usize) -> Vec<f64> {

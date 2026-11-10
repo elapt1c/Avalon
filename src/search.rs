@@ -1503,7 +1503,7 @@ fn score_cell(
         // disfavoured. This is what stops busy corridors from matching.
         let mut silence = 1.0f64;
         let mut extra_dbg = 0usize;
-        if top.is_finite() {
+        if top.is_finite() && top > 0.0 {
             let stride = ((30.0 / tracks[top_ids.0].1.dt.max(1e-3)) as usize).max(1);
             let a = tracks[top_ids.0].1.cpa_stride(obs, stride);
             let b = tracks[top_ids.1].1.cpa_stride(obs, stride);
@@ -1570,7 +1570,11 @@ fn score_cell(
             // Contrast against the competing hypotheses in this cell: a dense
             // area where many pairs fit almost as well should not outrank a
             // quiet area with one clean match.
-            let rest: Vec<f32> = scored.iter().copied().filter(|v| *v < top).collect();
+            let rest: Vec<f32> = scored
+                .iter()
+                .copied()
+                .filter(|v| v.is_finite() && *v < top)
+                .collect();
             let margin = if rest.is_empty() {
                 0.35 * top
             } else {
@@ -1656,7 +1660,11 @@ silence {silence:.4} (extra audible passes {extra_dbg}), final {score:.4}"
         }
     }
 
-    (best, best_rmse, best_pair)
+    if best.is_finite() {
+        (best, best_rmse, best_pair)
+    } else {
+        (0.0, f32::INFINITY, String::new())
+    }
 }
 
 /// Joint score for a flight pair: one shared clock offset maximises S1 + S2.
@@ -1683,6 +1691,23 @@ fn score_pair(
     let c0 = if frame_step > 1 { &e0.coarse_curve } else { &e0.curve };
     let c1 = if frame_step > 1 { &e1.coarse_curve } else { &e1.curve };
     let mut r0 = vec![f64::INFINITY; shifts.len()];
+    if score::closed_solve() {
+        for (i, &sh) in shifts.iter().enumerate() {
+            if let Some((v, _f0)) = score::curve_fit_closed(
+                c0,
+                track0,
+                obs,
+                base_abs,
+                sh,
+                Atmos::default(),
+                MAX_ERR_HZ,
+                e0.spec.f0 as f64,
+                score::f0_half_width(),
+            ) {
+                r0[i] = v;
+            }
+        }
+    } else {
     for &f0 in &score::f0_grid(e0.spec.f0 as f64, f0_steps) {
         for (i, &sh) in shifts.iter().enumerate() {
             for &df in offsets {
@@ -1704,7 +1729,25 @@ fn score_pair(
             }
         }
     }
+    }
     let mut r1 = vec![f64::INFINITY; shifts.len()];
+    if score::closed_solve() {
+        for (i, &sh) in shifts.iter().enumerate() {
+            if let Some((v, _f0)) = score::curve_fit_closed(
+                c1,
+                track1,
+                obs,
+                base_abs,
+                sh,
+                Atmos::default(),
+                MAX_ERR_HZ,
+                e1.spec.f0 as f64,
+                score::f0_half_width(),
+            ) {
+                r1[i] = v;
+            }
+        }
+    } else {
     for &f0 in &score::f0_grid(e1.spec.f0 as f64, f0_steps) {
         for (i, &sh) in shifts.iter().enumerate() {
             for &df in offsets {
@@ -1725,6 +1768,7 @@ fn score_pair(
                 }
             }
         }
+    }
     }
     // Report the best joint residual rather than an absolute verdict: how small
     // a residual is achievable depends on how well the audio itself can be
