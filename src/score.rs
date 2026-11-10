@@ -662,10 +662,17 @@ pub fn curve_rmse(
 /// (visible as a vertical bias against the spectrogram), and a pure offset is
 /// not absorbable by scale: at 180 Hz, 3 Hz is 1.7 %.
 #[allow(clippy::too_many_arguments)]
-/// Runtime switch for the alternative (DOPPLERGEIST-style) backend.
+/// Runtime switch for the scoring backend. Defaults to the DOPPLERGEIST-style
+/// rules (pseudo-Huber loss, silence as a reject against the fitted slant).
 pub fn dg_mode() -> bool {
     static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHED.get_or_init(|| std::env::var("AOS_METHOD").map(|v| v == "dg").unwrap_or(false))
+    // Production default: the DOPPLERGEIST-style rules. Set AOS_METHOD=legacy to
+    // fall back to the old squared-error / multiplicative-silence backend.
+    *CACHED.get_or_init(|| {
+        std::env::var("AOS_METHOD")
+            .map(|v| v != "legacy")
+            .unwrap_or(true)
+    })
 }
 
 pub fn curve_rmse_offset(

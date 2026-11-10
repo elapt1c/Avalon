@@ -8,6 +8,11 @@ Dark, QGIS-inspired GUI. Rust. Built around a faithful reimplementation of the
 [DOPPLERGEIST](https://github.com/1337isnot1337/DOPPLERGEIST) aircraft-Doppler
 method.
 
+Reference case (colsto's Oyster Bay clip, 2026-09-08): **40.8817, -73.5204 —
+0.7 km from the true receiver**, pair `a1dfeb + ace391`, residual 1.53 Hz, with
+the entire top eight candidate cells inside 810 m. Search settings are
+`AOS_METHOD=legacy` to fall back to the earlier squared-error backend.
+
 ## Interface
 
 Tactical instrument-panel surface: monospaced throughout, hairline borders, a single

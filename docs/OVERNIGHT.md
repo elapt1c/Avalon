@@ -1,5 +1,25 @@
 # Overnight log — 2026-11-09
 
+## Backend switch (production default since this session)
+
+Scoring now defaults to the **DOPPLERGEIST-style** rules — pseudo-Huber loss
+(delta 1 Hz) instead of squared error, and the silence test as a *reject* against
+`max(fitted slant)` rather than a multiplicative penalty over doubled distance.
+`AOS_METHOD=legacy` restores the previous backend.
+
+Same analysis input, same box, only the scoring differs:
+
+| | legacy | dg (default) |
+|---|---|---|
+| surviving cells | 7,040 | **921** |
+| best score / residual | 0.248 / 2.20 Hz | 0.251 / **1.53 Hz** |
+| answer | 40.8817,-73.5204 | 40.8817,-73.5204 |
+| top-8 cells, distance from truth | 0.70, **9.26, 7.08, 9.24, 8.54**, 0.70, 7.51, 16.30 km | **0.70, 0.58, 0.18, 0.81, 0.42, 0.70, 0.80, 0.18 km** |
+
+The legacy backend finds the right point and then ranks 7–16 km candidates next.
+The dg backend keeps its entire top eight inside 810 m, and leaves 248 cells
+within 5 km versus 588 — no halo of plausible-but-wrong candidates.
+
 ## RESOLVED: 0.7 km
 
 Two scoring terms were deleting the correct answer, both visible only when the
