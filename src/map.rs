@@ -359,6 +359,18 @@ impl MapState {
         self.cam_t = 1.0;
     }
 
+    /// As `fly_to_points`, without animation (used when opening a finished run).
+    pub fn snap_to_points(&mut self, pts: &[(f64, f64)]) {
+        self.fly_to_points(pts);
+        if let Some((cx, cy, z)) = self.cam_to.take() {
+            self.cx = cx;
+            self.cy = cy;
+            self.zoom = z;
+        }
+        self.cam_from = None;
+        self.cam_t = 1.0;
+    }
+
     /// Fly to a set of points (lat, lon) with padding — used to frame the
     /// candidate cluster once the solver has one, instead of leaving the answer
     /// as a speck inside the whole search box.

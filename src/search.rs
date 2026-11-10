@@ -553,6 +553,9 @@ pub fn run_search(
                 snap.candidates_done = scored_total + end;
                 snap.candidates_total = snap.candidates_done;
                 snap.elapsed_s = t_start.elapsed().as_secs_f64();
+                // Throughput must update inside the block loop, otherwise the
+                // strip reports 0 cells/s for the whole level.
+                snap.cells_per_s = done as f64 / t_block.elapsed().as_secs_f64().max(1e-6);
                 snap.cells_matched = frontier[..end].iter().filter(|c| c.score.is_finite()).count();
                 crate::log::info(
                     "search",

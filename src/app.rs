@@ -782,7 +782,7 @@ impl App {
                     ui.add(
                         egui::ProgressBar::new(fraction)
                             .desired_width(240.0)
-                            .animate(fraction <= 0.0)
+                            .animate(false)
                             .text(format!("{:.0}%", fraction * 100.0)),
                     );
                     ui.add(
@@ -1253,7 +1253,7 @@ impl App {
                     // rotating indicators for one job read as two jobs.
                     ui.add(
                         egui::ProgressBar::new(frac)
-                            .animate(frac <= 0.0)
+                            .animate(false)
                             .text(format!("{:.0}%  {stage}", frac * 100.0)),
                     );
                     if ui.button("Stop").clicked() {
@@ -1318,15 +1318,18 @@ impl App {
     /// Open the map with the current search heatmap.
     fn open_heatmap(&mut self, ctx: &egui::Context) {
         let Some(res) = self.search_result.clone() else { return };
-        // Zoom so the searched box fills the map: pick the zoom whose span in
-        // degrees is closest to the box size.
+        self.map = MapState::new(40.0, -100.0, 4.0);
         if let Some(b) = res.bounds {
-            let (lat, lon) = b.center();
-            let span = (b.north - b.south).max(b.east - b.west).max(0.02);
-            let zoom = (360.0 / span / 3.0).log2().clamp(3.0, 11.0) as f32;
-            self.map = MapState::new(lat, lon, zoom);
+            self.map.snap_to_bounds(b);
         }
         self.map.set_heatmap(ctx, &res.cells, res.step_deg);
+        // Frame the answer, not the search box: a continental box leaves the
+        // winner as a dot on the bottom edge.
+        let mut pts: Vec<(f64, f64)> = res.best.iter().take(3).map(|c| (c.lat, c.lon)).collect();
+        pts.extend(res.modes.iter().take(3).map(|m| (m.lat, m.lon)));
+        if !pts.is_empty() {
+            self.map.snap_to_points(&pts);
+        }
         self.map.set_marker(None);
         self.map.mode = Mode::Pan;
         self.map_purpose = MapPurpose::Heatmap;
