@@ -324,13 +324,49 @@ impl MapState {
         if !b.valid() {
             return;
         }
-        let (lat, lon) = b.center();
-        let span = (b.north - b.south).abs().max((b.east - b.west).abs()).max(1e-4);
-        // Fit the span into a 900 px viewport, with a little margin.
-        let zoom = (360.0f64 / span / 3.2).log2().clamp(2.0, 17.0) as f32;
+        // Fit in *Mercator* space: the geometric midpoint of a tall box and the
+        // midpoint of its projected extent are not the same point, and using the
+        // former pushed the answer towards the top or bottom edge of the view.
+        let y_n = lat_to_world_y(b.north);
+        let y_s = lat_to_world_y(b.south);
+        let cy = (y_n + y_s) * 0.5;
+        let cx = (lon_to_world_x(b.west) + lon_to_world_x(b.east)) * 0.5;
+        let span_y = (y_n - y_s).abs().max(1e-6);
+        let span_x = (lon_to_world_x(b.east) - lon_to_world_x(b.west)).abs().max(1e-6);
+        // Screen is ~900 px tall in the solve view; pick the zoom that fits the
+        // larger of the two spans with a little margin.
+        let span = span_x.max(span_y);
+        let zoom = (1.0f64 / span / 1.4).log2().clamp(2.0, 17.0) as f32;
         self.cam_from = Some((self.cx, self.cy, self.zoom));
-        self.cam_to = Some((lon_to_world_x(lon), lat_to_world_y(lat), zoom));
+        self.cam_to = Some((cx, cy, zoom));
         self.cam_t = 0.0;
+    }
+
+    /// Fly to a set of points (lat, lon) with padding — used to frame the
+    /// candidate cluster once the solver has one, instead of leaving the answer
+    /// as a speck inside the whole search box.
+    pub fn fly_to_points(&mut self, pts: &[(f64, f64)]) {
+        let (mut s, mut n) = (f64::INFINITY, f64::NEG_INFINITY);
+        let (mut w, mut e) = (f64::INFINITY, f64::NEG_INFINITY);
+        for (lat, lon) in pts {
+            s = s.min(*lat);
+            n = n.max(*lat);
+            w = w.min(*lon);
+            e = e.max(*lon);
+        }
+        if !s.is_finite() {
+            return;
+        }
+        // Never zoom tighter than ~1.2 km across: a single point would otherwise
+        // slam the camera to maximum zoom.
+        let pad_lat = ((n - s) * 0.6).max(0.006);
+        let pad_lon = ((e - w) * 0.6).max(0.009);
+        self.fly_to_bounds(Bounds {
+            west: w - pad_lon,
+            south: s - pad_lat,
+            east: e + pad_lon,
+            north: n + pad_lat,
+        });
     }
 
     /// Step the camera animation. Called once per frame from `show`.

@@ -307,7 +307,13 @@ impl App {
                 Ok(Progress::Stage { name, fraction }) => {
                     self.analysis = AnalysisState::Running { fraction, stage: name.to_string() };
                 }
-                Ok(Progress::Log(msg)) => self.log.push(msg),
+                Ok(Progress::Log(msg)) => {
+                    self.log.push(msg);
+                    if self.log.len() > 400 {
+                        let drop = self.log.len() - 400;
+                        self.log.drain(0..drop);
+                    }
+                }
                 Ok(Progress::Done(result)) => {
                     let plausible: Vec<usize> = result
                         .events
@@ -486,6 +492,12 @@ impl App {
                 Ok(SearchMsg::Done(result)) => {
                     if let Some(b) = result.best.first() {
                         self.solve_map.winner = Some((b.lat, b.lon));
+                        // Frame the answer: the search box can be continental, in
+                        // which case the winner is a speck at the edge of it.
+                        let mut pts: Vec<(f64, f64)> =
+                            result.best.iter().take(3).map(|c| (c.lat, c.lon)).collect();
+                        pts.extend(result.modes.iter().take(3).map(|m| (m.lat, m.lon)));
+                        self.solve_map.fly_to_points(&pts);
                         self.solve_map.peaks.clear();
                     }
                     if let Some(best) = result.best.first() {
@@ -702,18 +714,52 @@ impl App {
         let (fraction, text): (f32, String) = if searching {
             match &self.search_snapshot {
                 Some(s) => {
-                    let eta = if s.eta_s.is_finite() && s.eta_s > 0.0 {
-                        format!(" · ETA {:+.0}s", s.eta_s)
+                    let downloading = s.bytes_total > 0 && s.bytes_read < s.bytes_total;
+                    if downloading {
+                        // Report the phase that is actually running: showing
+                        // "0 cells/s" during a multi-GB download made a healthy
+                        // run look hung for half an hour.
+                        let frac = (s.bytes_read as f32 / s.bytes_total.max(1) as f32).clamp(0.0, 1.0);
+                        let mb_s = if s.elapsed_s > 0.5 {
+                            s.bytes_read as f64 / 1e6 / s.elapsed_s
+                        } else {
+                            0.0
+                        };
+                        (
+                            frac,
+                            format!(
+                                "{} · {:.2} / {:.2} GB · {:.1} MB/s · {} traces · {:.0}s elapsed",
+                                s.stage,
+                                s.bytes_read as f64 / 1e9,
+                                s.bytes_total as f64 / 1e9,
+                                mb_s,
+                                s.traces_seen,
+                                s.elapsed_s
+                            ),
+                        )
+                    } else if s.stage.contains("Fetching") || s.cells_matched == 0 {
+                        // Parsing phase: no cells exist yet by definition.
+                        (
+                            0.0,
+                            format!(
+                                "{} · parsing · {} traces · {} flights kept · {:.0}s elapsed",
+                                s.stage, s.traces_seen, s.flights_kept, s.elapsed_s
+                            ),
+                        )
                     } else {
-                        String::new()
-                    };
-                    (
-                        s.fraction.clamp(0.0, 1.0),
-                        format!(
-                            "{} · {} · {:.0} cells/s · {:.0}s{}",
-                            s.stage, s.detail, s.cells_per_s, s.elapsed_s, eta
-                        ),
-                    )
+                        let eta = if s.eta_s.is_finite() && s.eta_s > 0.0 {
+                            format!(" · ETA {:+.0}s", s.eta_s)
+                        } else {
+                            String::new()
+                        };
+                        (
+                            s.fraction.clamp(0.0, 1.0),
+                            format!(
+                                "{} · {} · {:.0} cells/s · {} matched · {:.0}s{}",
+                                s.stage, s.detail, s.cells_per_s, s.cells_matched, s.elapsed_s, eta
+                            ),
+                        )
+                    }
                 }
                 None => (0.0, "locate: starting…".to_string()),
             }
@@ -938,7 +984,11 @@ impl App {
                 });
 
                 theme::section(ui, "log");
-                for line in &self.log {
+                // Newest at the bottom, and only what fits: the log is verbose
+                // now, so showing every line pushed the interesting ones off.
+                let rows = ((ui.available_height() - 8.0) / 14.0).floor().max(3.0) as usize;
+                let start = self.log.len().saturating_sub(rows);
+                for line in &self.log[start..] {
                     ui.add(
                         egui::Label::new(
                             egui::RichText::new(line)
@@ -1536,7 +1586,13 @@ impl App {
 
     fn central_panel(&mut self, ui: &mut egui::Ui) {
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(theme::BG))
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::BG)
+                    // Text was butting against the vertical divider to the left
+                    // panel; give the content its own left gutter.
+                    .inner_margin(egui::Margin { left: 18, right: 12, top: 10, bottom: 8 }),
+            )
             .show(ui, |ui| {
             // The locate stage is where the real work happens; keep it in the
             // main area for the whole run *and* afterwards, so a failure shows

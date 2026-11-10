@@ -186,6 +186,8 @@ pub fn fetch_flights(
         let entries = archive.entries().context("reading archive")?;
 
         prog.asset = format!("parsing {tag}");
+        let entry_start = std::time::Instant::now();
+        crate::log::info("flights", &format!("{tag}: starting parse at rss {:.0} MB", crate::log::rss_bytes() as f64 / 1e6));
         let day_start = flights.len();
         let mut last_emit = std::time::Instant::now();
         // Reading the tar is inherently serial, but every member is an
@@ -224,6 +226,19 @@ pub fn fetch_flights(
                 .read_to_end(&mut raw)
                 .context("reading trace member")?;
             prog.traces_seen += 1;
+            if prog.traces_seen % 1500 == 0 {
+                let rate = prog.traces_seen as f64 / (entry_start.elapsed().as_secs_f64().max(1e-6));
+                crate::log::info(
+                    "flights",
+                    &format!(
+                        "{tag}: {} traces parsed ({:.0}/s), {} flights kept, rss {:.0} MB",
+                        prog.traces_seen,
+                        rate,
+                        prog.flights_kept,
+                        crate::log::rss_bytes() as f64 / 1e6
+                    ),
+                );
+            }
             batch.push(raw);
             if batch.len() >= parse_batch {
                 flush(&mut batch, &mut flights);

@@ -525,6 +525,7 @@ pub fn run_search(
         // level (level 0 alone can run for minutes).
         {
             const BLOCK: usize = 4_000;
+            let t_block = std::time::Instant::now();
             let mut done = 0usize;
             while done < frontier.len() {
                 let end = (done + BLOCK).min(frontier.len());
@@ -553,6 +554,18 @@ pub fn run_search(
                 snap.candidates_total = snap.candidates_done;
                 snap.elapsed_s = t_start.elapsed().as_secs_f64();
                 snap.cells_matched = frontier[..end].iter().filter(|c| c.score.is_finite()).count();
+                crate::log::info(
+                    "search",
+                    &format!(
+                        "level {level}: {}/{} cells scored @ {:.0} m, {:.0} cells/s, best {:.3}, {:.0}s",
+                        end,
+                        frontier.len(),
+                        step_m,
+                        done as f64 / t_block.elapsed().as_secs_f64().max(1e-6),
+                        top.first().map(|c| c.score).unwrap_or(0.0),
+                        t_start.elapsed().as_secs_f64()
+                    ),
+                );
                 on_progress(snap.clone());
             }
         }
