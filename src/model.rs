@@ -276,7 +276,16 @@ impl Default for AnalysisSettings {
             window_s: 3.0,
             hop_s: 0.25,
             // FFT is 4x the window -> ~0.08 Hz bin spacing at 8 kHz.
-            fft_pad: 4,
+            // 4x zero-padding costs 2.4x the analysis time (24 s vs 10 s per
+            // recorded hour) and buys only interpolation, but pad=1 changed which
+            // events the pipeline selects and the reference case degraded to
+            // 9.8 km with the wrong aircraft pair. Keep 4 until event selection is
+            // robust; AOS_FFT_PAD overrides for experiments.
+            fft_pad: std::env::var("AOS_FFT_PAD")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .filter(|v| *v >= 1 && *v <= 8)
+                .unwrap_or(4),
             seed_contrast: 2.5,
             target_sample_rate: 8000,
         }
